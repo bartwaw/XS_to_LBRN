@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.lbrn2
+*.lbrn2.tmp
+*.xs
+*.xcs
+.pytest_cache/
+.venv/
