@@ -97,6 +97,10 @@ Window settings are stored in `~/.xs2lightburn.json`.
   change with new xTool Studio versions. Please open an issue with a sample file if a project
   does not convert correctly.
 
+## Support
+
+If the converter saves you time, you can [buy me a coffee](https://buymeacoffee.com/bartwaw).
+
 ## Disclaimer
 
 Laser parameters are only starting points. Always run a material test before a real job.
@@ -200,6 +204,10 @@ Przykłady (nazwy i opisy) są po angielsku w obu wersjach językowych.
 - Format `.xs` nie jest opisany przez xTool; został rozpracowany na prawdziwych plikach i może
   się zmienić w nowych wersjach xTool Studio. Jeśli projekt konwertuje się źle, załóż zgłoszenie
   (issue) z przykładowym plikiem.
+
+### Wsparcie
+
+Jeśli konwerter oszczędza Ci czas, możesz [postawić mi kawę](https://buymeacoffee.com/bartwaw).
 
 ### Zastrzeżenie
 

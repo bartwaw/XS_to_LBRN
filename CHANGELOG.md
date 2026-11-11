@@ -19,6 +19,7 @@ First public release.
 - Material database: *Import...* (merges a JSON file, asks about duplicate names),
   *Export...* and *Add examples*.
 - Synthetic test suite (`tests/test_synthetic.py`); it needs no sample projects.
+- *Sponsor* button on GitHub and a Support section in the README (Buy Me a Coffee).
 
 ### Changed
 - The material database starts with three example materials, not a full table.
