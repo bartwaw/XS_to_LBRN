@@ -13,7 +13,7 @@ Run without arguments to open the window. Console mode:
     python3 xs2lightburn.py file.xs [file2.xcs ...] [-o folder] [--mirror-x] [--mirror-y]
     python3 xs2lightburn.py --help
 
-MIT License. https://github.com/bartwaw/xs2lightburn
+MIT License. https://github.com/bartwaw/XS_to_LBRN
 """
 
 import base64
