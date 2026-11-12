@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -276,7 +277,7 @@ def test_damaged_files_give_readable_errors():
     t = tmpdir()
     (t / "bad.xs").write_bytes(b"PK\x03\x04garbage")
     (t / "bad.xcs").write_text("{not json")
-    for name, word in (("bad.xs", "archive"), ("bad.xcs", "JSON")):
+    for name, word in (("bad.xs", "archive"), ("bad.xcs", "damaged data")):
         try:
             X.convert_file(t / name, t, quiet)
         except Exception as e:
@@ -915,6 +916,277 @@ def test_gui_lightburn_buttons():
         fake.close()
         paths.__exit__()
         X.set_lang("en")
+
+
+def _R():
+    sys.path.insert(0, str(ROOT / "tests"))
+    import rld_synth
+    return rld_synth
+
+
+def _rld_file(t, **kw):
+    path = t / kw.pop("name", "proj.rld")
+    path.write_bytes(_R().build(**kw))
+    return path
+
+
+def _png_rows(png):
+    """(color type, rows without the filter byte) of a PNG written by the converter."""
+    import zlib
+    w, h, _bd, ctype = struct.unpack(">IIBB", png[16:26])
+    raw = zlib.decompress(png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8])
+    n = w * (1 if ctype == 0 else 3) + 1
+    return ctype, [raw[i * n + 1:(i + 1) * n] for i in range(h)]
+
+
+def test_rld_layers_and_geometry():
+    X.set_lang("en")
+    R = _R()
+    t = tmpdir()
+    gray = [[0, 255, 0], [255, 0, 255]]   # 3 x 2 pixels, top row first
+    objs = [
+        ("path", "000000", True, R.rect(1160, 770, 30, 20)),
+        ("path", "ff0000", False, [R.line(100, 700, 110, 700),
+                                   R.curve((110, 700), (120, 710), (115, 700), (120, 705))]),
+        ("bitmap", "00ff00", (500.0, 530.0, 600.0, 620.0), R.bmp8(3, 2, gray)),
+        ("path", "123456", True, R.rect(10, 10, 5, 5)),     # color outside the palette
+        # closed path whose last point is not the first one: a closing line is added
+        ("path", "ff0000", True, [R.line(0, 0, 10, 0), R.line(10, 0, 10, 10)]),
+    ]
+    path = _rld_file(t, vector={-1: {"speed": 123.0, "min": 11.0, "max": 22.0, "air": 0},
+                                1: {"scan": True, "interval": 0.15, "passes": 3, "out": 0}},
+                     bitmap={2: {"speed": 77.0, "min": 33.0, "max": 44.0, "flags": (1, 0, 0)}},
+                     objects=objs)
+    assert X.is_rld(path)
+    logs = []
+    cv = X.read_project(path, logs.append)[0]
+    assert cv.machine.startswith("RDWorks") and "1200 x 800" in cv.machine
+    assert [it.kind for it in cv.items] == ["path", "path", "bitmap", "path", "path"]
+    black, red, img, odd, tri = cv.items
+    assert black.rd_spec["kind"] == "cut" and black.rd_spec["speed"] == 123.0
+    assert (black.rd_spec["min_power"], black.rd_spec["power"], black.rd_spec["air"]) == \
+        (11.0, 22.0, 0)
+    rs = red.rd_spec
+    assert (rs["kind"], rs["interval"], rs["passes"], rs["off"]) == ("fill", 0.15, 3, 1)
+    assert img.rd_spec["kind"] == "image" and img.rd_spec["speed"] == 77.0
+    # the negative flag is not verified yet: never carried over, a warning instead
+    assert (img.rd_spec["power"], img.rd_spec["negative"], img.rd_spec["dither"]) == \
+        (44.0, 0, "threshold")
+    assert sum("Negative Engrave" in m for m in logs) == 1, logs
+    assert odd.rd_spec["off"] == 1 and odd.rd_spec["power"] == 0.0
+    assert any("123456" in m for m in logs)
+    # Y axis: RDWorks counts up from the bed bottom, the converter's screen space counts down
+    sp = black.subpaths[0]
+    assert sp.closed and len(sp.pts) == 4 and len(sp.segs) == 4
+    assert (1190.0, 10.0) in sp.pts and (1160.0, 30.0) in sp.pts
+    sp = red.subpaths[0]
+    assert not sp.closed and sp.pts == [(100, 100), (110, 100), (120, 90)]
+    assert sp.segs[1] == ("C", (115, 100), (120, 95))
+    sp = tri.subpaths[0]
+    assert sp.closed and sp.pts == [(0, 800), (10, 800), (10, 790)] and len(sp.segs) == 3
+    # bitmap: BMP stored bottom-up -> PNG top row first; placed at its frame
+    assert img.ow == 3 and img.oh == 2 and img.matrix == [10.0, 0, 0, 10.0, 500.0, 180.0]
+    assert _png_rows(img.png) == (0, [bytes(gray[0]), bytes(gray[1])])
+    # any of the three unverified bitmap switches gives the warning
+    for flags in ((0, 1, 0), (0, 0, 1)):
+        logs = []
+        X.read_project(_rld_file(t, name="f.rld", bitmap={2: {"flags": flags}}, objects=objs[2:3]),
+                       logs.append)
+        assert any("Negative Engrave" in m for m in logs), (flags, logs)
+    logs = []
+    X.read_project(_rld_file(t, name="f.rld", objects=objs[2:3]), logs.append)
+    assert not any("WARNING" in m for m in logs), logs
+
+
+def test_rld_layer_warnings():
+    X.set_lang("en")
+    R = _R()
+    t = tmpdir()
+    objs = [("path", "ff0000", True, R.rect(10, 10, 5, 5)),
+            ("path", "00ff00", True, R.rect(30, 10, 5, 5))]
+    # "0,15" typed with a comma ends up as 0.00254 in RDWorks; unknown mode byte
+    logs = []
+    cv = X.read_project(_rld_file(t, vector={1: {"scan": True, "interval": 0.00254},
+                                             2: {"mode": 7}}, objects=objs), logs.append)[0]
+    assert any("very small line interval" in m and "#ff0000" in m for m in logs), logs
+    assert cv.items[0].rd_spec["kind"] == "fill"
+    g = cv.items[1].rd_spec
+    assert (g["kind"], g["off"]) == ("cut", 1)
+    assert any("unknown RDWorks processing mode (7)" in m and "output off" in m
+               for m in logs), logs
+    # every warning is logged once, with the WARNING prefix
+    warns = [m for m in logs if "WARNING" in m]
+    assert len(warns) == len(set(warns)) == 2, warns
+    # invalid speed (negative, zero, huge): 100 mm/s and a warning
+    for bad in (-50.0, 0.0, 1e5, float("nan")):
+        logs = []
+        cv = X.read_project(_rld_file(t, name="v.rld", vector={1: {"speed": bad}},
+                                      objects=objs[:1]), logs.append)[0]
+        assert cv.items[0].rd_spec["speed"] == 100.0, bad
+        assert any("invalid RDWorks layer speed" in m for m in logs), (bad, logs)
+    # bitmap on the black layer: vector settings of that layer, Image layer, warning
+    logs = []
+    cv = X.read_project(_rld_file(t, name="k.rld", vector={-1: {"speed": 55.0, "max": 40.0}},
+                                  objects=[("bitmap", "000000", (0.0, 2.0, 0.0, 1.0),
+                                            R.bmp8(2, 1, [[0, 255]]))]), logs.append)[0]
+    s = cv.items[0].rd_spec
+    assert (s["kind"], s["speed"], s["power"], s["dither"]) == ("image", 55.0, 40.0, "threshold")
+    assert any("black layer" in m for m in logs), logs
+    # closed path whose end is within the tolerance of its start: no extra closing segment
+    pts = R.rect(10, 10, 5, 5)
+    t3, v = pts[-1]
+    pts[-1] = (t3, v[:2] + (v[2] + 1e-4, v[3]) + v[4:])
+    cv = X.read_project(_rld_file(t, name="c.rld", objects=[("path", "ff0000", True, pts)]),
+                        quiet)[0]
+    sp = cv.items[0].subpaths[0]
+    assert sp.closed and len(sp.pts) == len(sp.segs) == 4
+    # empty project: warning, no summary line
+    logs = []
+    cv = X.read_project(_rld_file(t, name="e.rld"), logs.append)[0]
+    assert not cv.items and any("no objects found" in m for m in logs)
+    assert not any("layers:" in m for m in logs), logs
+
+
+def test_rld_bmp_formats():
+    R = _R()
+    w2 = [[0, 1, 1, 0, 1, 0, 0, 1, 1], [1, 0, 0, 1, 0, 1, 1, 0, 0]]
+    # 1 bit, black and white: gray PNG, 2 levels
+    png, w, h, lv = X._bmp_to_png(R.bmp(1, 9, w2))
+    assert (w, h, lv) == (9, 2, 2)
+    assert _png_rows(png) == (0, [bytes(255 * v for v in r) for r in w2])
+    # 4 bit with a gray palette, stored top-down
+    rows = [[0, 5, 15], [15, 10, 0]]
+    png, w, h, lv = X._bmp_to_png(R.bmp(4, 3, rows, top_down=True))
+    assert (w, h, lv) == (3, 2, 3)
+    assert _png_rows(png) == (0, [bytes(v * 17 for v in r) for r in rows])
+    # 8 bit with a color palette: RGB PNG
+    pal = [(255, 0, 0), (0, 0, 255)] + [(0, 0, 0)] * 254
+    png, w, h, lv = X._bmp_to_png(R.bmp(8, 2, [[0, 1]], palette=pal))
+    assert lv == 256 and _png_rows(png) == (2, [bytes((255, 0, 0, 0, 0, 255))])
+    # 8 bit with a palette shorter than 256 entries (biClrUsed = 2)
+    png, w, h, lv = X._bmp_to_png(R.bmp(8, 3, [[0, 1, 0]], palette=[(0, 0, 0), (255, 255, 255)]))
+    assert lv == 2 and _png_rows(png) == (0, [bytes((0, 255, 0))])
+    # 24 bit: color stays RGB, black and white becomes a 2-level gray image (Threshold)
+    png, *_ = X._bmp_to_png(R.bmp(24, 2, [[(1, 2, 3), (250, 251, 252)]]))
+    assert _png_rows(png) == (2, [bytes((1, 2, 3, 250, 251, 252))])
+    png, w, h, lv = X._bmp_to_png(R.bmp(24, 2, [[(0, 0, 0), (255, 255, 255)]] * 2))
+    assert lv == 2 and _png_rows(png) == (0, [bytes((0, 255))] * 2)
+    # 32 bit with alpha: transparent pixels become white (not burned)
+    png, *_ = X._bmp_to_png(R.bmp(32, 3, [[(0, 0, 0, 0), (0, 0, 0, 255), (100, 100, 100, 128)]]))
+    assert _png_rows(png) == (0, [bytes((255, 0, 178))])
+    # the alpha decision is made for the whole image: a fully transparent margin row stays white
+    png, *_ = X._bmp_to_png(R.bmp(32, 2, [[(0, 0, 0, 0)] * 2, [(0, 0, 0, 255), (9, 8, 7, 255)]]))
+    assert _png_rows(png) == (2, [bytes((255,) * 6), bytes((0, 0, 0, 9, 8, 7))])
+    # 32 bit with an empty alpha channel (common for "XRGB"): alpha ignored
+    png, *_ = X._bmp_to_png(R.bmp(32, 1, [[(9, 8, 7, 0)]]))
+    assert _png_rows(png) == (2, [bytes((9, 8, 7))])
+    # BI_BITFIELDS: the usual B, G, R(, A) layout is read; alpha mask 0 means no alpha
+    std = (0xff0000, 0xff00, 0xff)
+    png, *_ = X._bmp_to_png(R.bmp(32, 1, [[(9, 8, 7, 0)]], comp=3, masks=std))
+    assert _png_rows(png) == (2, [bytes((9, 8, 7))])
+    png, *_ = X._bmp_to_png(R.bmp(32, 2, [[(9, 8, 7, 0), (9, 8, 7, 255)]], comp=3,
+                                  masks=std + (0xff000000,)))
+    assert _png_rows(png) == (2, [bytes((255, 255, 255, 9, 8, 7))])
+    png, *_ = X._bmp_to_png(R.bmp(32, 2, [[(9, 8, 7, 0), (9, 8, 7, 255)]], comp=3,
+                                  masks=std + (0,)))
+    assert _png_rows(png) == (2, [bytes((9, 8, 7, 9, 8, 7))])
+    for hdr in (108, 124):   # V4 / V5 headers keep the masks at the same place
+        png, *_ = X._bmp_to_png(R.bmp(32, 2, [[(9, 8, 7, 0), (9, 8, 7, 255)]], comp=3,
+                                      masks=std + (0xff000000,), header=hdr))
+        assert _png_rows(png) == (2, [bytes((255, 255, 255, 9, 8, 7))]), hdr
+    # only two gray shades that are not black and white: still grayscale, not Threshold
+    png, w, h, lv = X._bmp_to_png(R.bmp(24, 2, [[(100, 100, 100), (200, 200, 200)]]))
+    assert lv == 3 and _png_rows(png) == (0, [bytes((100, 200))])
+    small_header = bytearray(R.bmp(8, 2, [[0, 1]]))
+    small_header[14:18] = struct.pack("<I", 12)
+    for bad in (R.bmp(8, 2, [[0, 1]], comp=1), b"BM" + b"\x00" * 60, R.bmp(8, 2, [[0, 1]])[:70],
+                bytes(small_header),
+                R.bmp(32, 1, [[(9, 8, 7, 0)]], comp=3, masks=(0xff, 0xff00, 0xff0000)),
+                R.bmp(24, 1, [[(9, 8, 7)]], comp=3, masks=std),
+                R.bmp(32, 1, [[(9, 8, 7, 0)]], comp=3, masks=std + (0xff,)),
+                R.bmp(32, 1, [[(9, 8, 7, 0)]], comp=3, masks=std + (0xff000000,))[:68]):
+        try:
+            X._bmp_to_png(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad[:20])
+
+
+def test_rld_convert_and_errors():
+    X.set_lang("en")
+    R = _R()
+    t = tmpdir()
+    path = _rld_file(t, objects=[("path", "000000", True, R.rect(1160, 770, 30, 20)),
+                                 ("path", "ff0000", True, R.rect(1100, 770, 30, 20))],
+                     vector={1: {"speed": 25.0, "min": 20.0, "max": 60.0}})
+    root = ET.parse(convert(path, t, (True, True))).getroot()
+    names = [val(c, "name") for c in layers(root)]
+    assert names == ["000000 Cut 30% 100", "FF0000 Cut 20-60% 25"], names
+    assert "RDWorks" in root.find("Notes").get("Notes", "")
+    shapes = root.findall("Shape")
+    assert len(shapes) == 2 and all(s.get("Type") == "Path" for s in shapes)
+    # damaged / truncated files give readable errors, not crashes
+    for name, data in (("cut.rld", path.read_bytes()[:5000]),
+                       ("junk.rld", b"\x0fRDFILEVER8.0.01a" + b"\x00" * 100),
+                       ("other.rld", b"RDWorks 9 file? " + b"\x00" * 100)):
+        (t / name).write_bytes(data)
+        try:
+            X.convert_file(t / name, t, quiet)
+        except ValueError as e:
+            assert "RDWorks" in X.friendly_error(e), X.friendly_error(e)
+        else:
+            raise AssertionError(name)
+    # file cut off in the middle of an object: the rest is read, the loss is reported
+    data = path.read_bytes()
+    (t / "short.rld").write_bytes(data[:len(data) - 100])
+    logs = []
+    cv = X.read_project(t / "short.rld", logs.append)[0]
+    assert len(cv.items) == 1 and any("could not be read (1;" in m for m in logs), logs
+    # NaN in a segment and an unknown segment type: object skipped and reported
+    for seg in ((0, (float("nan"), 1, 2, 3, 0, 0, 0, 0)), (5, (0, 0, 1, 1, 0, 0, 0, 0))):
+        logs = []
+        cv = X.read_project(_rld_file(t, name="bad.rld", objects=[
+            ("path", "000000", False, [R.line(0, 0, 1, 1), seg]),
+            ("path", "000000", True, R.rect(0, 0, 5, 5))]), logs.append)[0]
+        assert len(cv.items) == 1 and any("could not be read" in m for m in logs), (seg, logs)
+    # file cut off inside a bitmap: counted as unreadable
+    logs = []
+    data = _rld_file(t, name="bm.rld", objects=[
+        ("path", "000000", True, R.rect(0, 0, 5, 5)),
+        ("bitmap", "00ff00", (0.0, 2.0, 0.0, 1.0), R.bmp8(2, 1, [[0, 255]]))]).read_bytes()
+    (t / "bm.rld").write_bytes(data[:len(data) - 45])
+    cv = X.read_project(t / "bm.rld", logs.append)[0]
+    assert [it.kind for it in cv.items] == ["path"]
+    assert any("could not be read (1;" in m for m in logs), logs
+    # compressed bitmap: skipped with a warning, the rest converts
+    bmp = R.bmp(8, 2, [[0, 1]], comp=1)
+    logs = []
+    cv = X.read_project(_rld_file(t, name="rle.rld", objects=[
+        ("bitmap", "00ff00", (0.0, 2.0, 0.0, 1.0), bmp),
+        ("path", "000000", True, R.rect(0, 0, 5, 5))]), logs.append)[0]
+    assert [it.kind for it in cv.items] == ["path"]
+    assert any("unsupported format" in m for m in logs), logs
+    # random bytes after the tables must not produce phantom objects
+    import random
+    rnd = random.Random(1)
+    noise = bytes(rnd.getrandbits(8) for _ in range(200000))
+    (t / "noise.rld").write_bytes(R.build() + noise)
+    cv = X.read_project(t / "noise.rld", quiet)[0]
+    assert not cv.items
+
+
+def test_rld_real_samples():
+    """Optional: XS2LB_RLD_SAMPLES=folder with real RDWorks files; each must convert."""
+    folder = os.environ.get("XS2LB_RLD_SAMPLES")
+    if not folder:
+        return "skipped: set XS2LB_RLD_SAMPLES to a folder with .rld files"
+    files = sorted(Path(folder).glob("*.rld"))
+    assert files, folder
+    t = tmpdir()
+    for f in files:
+        for out in X.convert_file(f, t, quiet, True, False, overwrite=True):
+            ET.parse(out)
 
 
 def main():

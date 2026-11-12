@@ -4,6 +4,20 @@ All notable changes to this project are listed here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [2.2] - 2026-11-12
+
+### Added
+- RDWorks 8 projects (`.rld`): vector shapes, Bezier curves, text (stored outlines), bitmaps
+  and layer settings (Cut / Scan, speed, min / max power, passes, air assist, output, line
+  interval). Works in the window, the console and with *Open in LightBurn*.
+- Warnings in the log for RDWorks settings that are not carried over yet (Negative Engrave,
+  Optimized Scan, Ramp Effect on bitmap layers), a suspiciously small line interval, invalid
+  speeds, unknown processing modes and objects that could not be read.
+
+### Changed
+- Texts that mentioned only xTool now say "project" / "source file" where they apply to both
+  xTool and RDWorks files.
+
 ## [2.1] - 2026-11-12
 
 ### Added

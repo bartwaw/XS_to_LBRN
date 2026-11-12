@@ -1,7 +1,7 @@
 # xs2lightburn
 
-Convert **xTool Studio** projects (`.xs`, `.xcs`) to **LightBurn** projects (`.lbrn2`),
-keeping layers and laser operations, not just the geometry.
+Convert **xTool Studio** (`.xs`, `.xcs`) and **RDWorks** (`.rld`) projects to **LightBurn**
+projects (`.lbrn2`), keeping layers and laser operations, not just the geometry.
 
 [Polski opis niżej](#polski)
 
@@ -20,6 +20,8 @@ keeping layers and laser operations, not just the geometry.
   added as files in `locales/` (see [Adding a language](#adding-a-language)).
 - **Open in LightBurn** with one click, and import material settings from a LightBurn library
   (`.clb` file or the library selected in a running LightBurn 2.2+).
+- Reads **RDWorks 8 projects (`.rld`)**: vector shapes, curves, text (as the outlines RDWorks
+  stores), bitmaps and layer settings (see [RDWorks projects](#rdworks-projects)).
 - Console mode for batch conversion.
 
 Operation mapping:
@@ -128,15 +130,43 @@ material) get Output off and power 0, and the layer name is marked.
 
 Window settings are stored in `~/.xs2lightburn.json`.
 
+## RDWorks projects
+
+`.rld` files from RDWorks 8 are read directly; RDWorks itself is not needed. The format is not
+documented, so the reader is based on sample files: check the first conversions in LightBurn.
+
+| RDWorks layer setting | LightBurn |
+|---|---|
+| Processing Mode Cut / Scan | Line / Fill layer (bitmaps: Image layer) |
+| Speed, Min / Max Power (Laser 1), Repeat num | Speed, Min / Max Power, Passes |
+| If Blowing, Is Output | Air Assist, Output |
+| Interval | Line interval (vector Scan layers; for bitmap layers check the value) |
+
+- Each RDWorks layer (color) becomes a LightBurn layer with the matching color where the
+  LightBurn palette allows it.
+- Text is converted from the outlines RDWorks stores in the file, so the font is not needed.
+- Bitmaps are embedded as they are stored in the file (uncompressed BMP, black and white,
+  grayscale or color; transparent areas become white). Dithering is set to *Threshold* for
+  images with only black and white pixels and *Jarvis* otherwise.
+- Not transferred yet: Scan Mode (direction), Overstriking, Ramp, Cutting After Sweeping, Seal,
+  Open / Close Delay, Laser 2-6 powers, the *Other layer parameters* window and, for bitmap
+  layers, Negative Engrave, Optimized Scan and Ramp Effect. If any of the last three is on, the
+  log says so: set the negative image in LightBurn yourself.
+- The shapes and their layout are kept, but not the position on the bed (as with xTool files):
+  place the job in LightBurn or use *Start From: Current Position* / *User Origin*.
+- The bitmap settings of the black layer are not recognized yet; a bitmap on the black layer
+  uses that layer's vector settings (the log says so).
+- Tip: type decimals in RDWorks with a dot. RDWorks reads "0,15" as 0.0025.
+
 ## Limitations
 
 - Text objects must be converted to paths in xTool Studio first (they are skipped with a warning).
 - xTool image adjustments (brightness, contrast, sharpening) are not transferred.
 - Only flat laser processing is supported (rotary and other modes are reported).
 - LightBurn has 30 color layers (C00-C29); larger projects are reported.
-- The `.xs` format is not documented by xTool. It was worked out from real files and may
-  change with new xTool Studio versions. Please open an issue with a sample file if a project
-  does not convert correctly.
+- The `.xs` and `.rld` formats are not documented by their makers. The converter is based on
+  sample files, and new versions of xTool Studio or RDWorks may change them. Please open an
+  issue with a sample file if a project does not convert correctly.
 
 ## Support
 
@@ -181,7 +211,8 @@ Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Polski
 
-Konwerter projektów **xTool Studio** (`.xs`, `.xcs`) do projektów **LightBurn** (`.lbrn2`).
+Konwerter projektów **xTool Studio** (`.xs`, `.xcs`) i **RDWorks** (`.rld`) do projektów
+**LightBurn** (`.lbrn2`).
 Przenosi warstwy i operacje lasera, a nie tylko geometrię.
 
 ### Co robi
@@ -195,7 +226,34 @@ Przenosi warstwy i operacje lasera, a nie tylko geometrię.
 - Opcjonalna **baza materiałów**: wybrany materiał zastępuje parametry z xTool.
 - Interfejs po angielsku i po polsku (przełącznik w oknie albo `--lang en|pl`). Kolejne języki
   to pliki w folderze `locales/` (opis w części angielskiej: *Adding a language*).
+- Czyta **projekty RDWorks 8 (`.rld`)**: kształty, krzywe, tekst (jako zapisane w pliku kontury
+  liter), bitmapy i parametry warstw.
 - Tryb konsolowy do konwersji wielu plików.
+
+### Projekty RDWorks
+
+Pliki `.rld` z RDWorks 8 są czytane bezpośrednio, bez RDWorks. Producent nie opisał formatu,
+konwerter opiera się na przykładowych plikach, więc pierwsze konwersje sprawdź w LightBurnie.
+
+- Każda warstwa (kolor) RDWorks staje się warstwą LightBurna w tym samym kolorze, jeśli paleta
+  LightBurna na to pozwala.
+- Przenoszone są: tryb Cut / Scan, prędkość, moc min / max (Laser 1), liczba przejść, nadmuch
+  (If Blowing), Is Output i odstęp linii (dla warstw bitmap sprawdź go).
+- Jeszcze nie są przenoszone: kierunek skanowania, Overstriking, Ramp, Cutting After Sweeping,
+  Seal, opóźnienia, moce laserów 2-6, okno *Other layer parameters*, a dla bitmap Negative
+  Engrave, Optimized Scan i Ramp Effect. Jeśli któreś z tych trzech jest włączone, log o tym
+  pisze: negatyw ustaw w LightBurnie.
+- Bitmapy przechodzą tak, jak są zapisane w pliku (nieskompresowany BMP: czarno-biały, w skali
+  szarości albo kolorowy; przezroczyste miejsca stają się białe). Obrazy, w których są tylko
+  czarne i białe piksele, dostają dithering *Threshold*, pozostałe *Jarvis*.
+- Parametry bitmap na czarnej warstwie nie są jeszcze rozpoznane: taka bitmapa dostaje
+  parametry wektorowe tej warstwy (log o tym pisze).
+- Tekst trafia do LightBurna jako kontury zapisane przez RDWorks, więc czcionka nie jest
+  potrzebna.
+- Układ kształtów zostaje, ale nie położenie na stole: ustaw zadanie w LightBurnie albo użyj
+  *Start From: Current Position* / *User Origin*.
+- Wskazówka: w RDWorks liczby dziesiętne wpisuj z kropką, bo "0,15" RDWorks odczytuje jako
+  0,0025.
 
 ### Wymagania
 
@@ -258,11 +316,11 @@ jak hasło). Cofniesz ją w LightBurnie: *Settings > Extensions > Manage API Sec
 
 - Tekst trzeba w xTool Studio zamienić na ścieżkę (inaczej jest pomijany z ostrzeżeniem).
 - Korekty obrazu z xTool (jasność, kontrast, wyostrzenie) nie są przenoszone.
-- Obsługiwana jest tylko obróbka płaska.
-- LightBurn ma 30 warstw kolorów (C00-C29).
-- Format `.xs` nie jest opisany przez xTool; został rozpracowany na prawdziwych plikach i może
-  się zmienić w nowych wersjach xTool Studio. Jeśli projekt konwertuje się źle, załóż zgłoszenie
-  (issue) z przykładowym plikiem.
+- Obsługiwana jest tylko obróbka płaska (obróbka obrotowa i inne tryby są zgłaszane w logu).
+- LightBurn ma 30 warstw kolorów (C00-C29); większe projekty są zgłaszane.
+- Formaty `.xs` i `.rld` nie są opisane przez producentów. Konwerter opiera się na przykładowych
+  plikach, a nowe wersje xTool Studio albo RDWorks mogą je zmienić. Jeśli konwersja wyjdzie
+  źle, załóż zgłoszenie (issue) z przykładowym plikiem.
 
 ### Wsparcie
 

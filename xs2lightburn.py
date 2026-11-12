@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xs2lightburn 2.1
-Converts xTool Studio projects (.xs, .xcs) to LightBurn projects (.lbrn2).
-Konwerter projektów xTool Studio (.xs, .xcs) do projektów LightBurn (.lbrn2).
+xs2lightburn 2.2
+Converts xTool Studio (.xs, .xcs) and RDWorks (.rld) projects to LightBurn projects (.lbrn2).
+Konwerter projektów xTool Studio (.xs, .xcs) i RDWorks (.rld) do projektów LightBurn (.lbrn2).
 
 Transfers geometry (paths, circles, rectangles, components as groups), bitmaps,
 layers (colors) and operations (cut, line engrave, fill, image engrave) with power,
 speed, passes, line interval and dithering.
 
 Run without arguments to open the window. Console mode:
-    python3 xs2lightburn.py file.xs [file2.xcs ...] [-o folder] [--mirror-x] [--mirror-y]
+    python3 xs2lightburn.py file.xs [file2.xcs file3.rld ...] [-o folder] [--mirror-x] [--mirror-y]
     python3 xs2lightburn.py --help
 
 MIT License. https://github.com/bartwaw/XS_to_LBRN
@@ -28,7 +28,7 @@ import zipfile
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
-VERSION = "2.1"
+VERSION = "2.2"
 MAX_ENTRY_BYTES = 100 * 1024 * 1024   # zabezpieczenie przed archiwum-bomba
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 
@@ -647,6 +647,7 @@ class Item:
         self.zorder = 0
         self.group = None       # id komponentu xTool (grupa w LightBurn)
         self.off = False        # w xTool wylaczony z obrobki
+        self.rd_spec = None     # RDWorks: gotowe parametry warstwy LightBurn
 
 
 class Canvas:
@@ -1073,8 +1074,421 @@ def _read_xs(z, log):
     return canvases
 
 
+# --- czytnik RDWorks (.rld) ----------------------------------------------------
+#
+# Format RDWorks 8 rozpracowany na plikach testowych (brak oficjalnej dokumentacji):
+#  - naglowek zmiennej dlugosci (zaczyna sie od "\x0fRDFILEVER"), w nim rozmiar stolu (mm);
+#  - tabela A: warstwy wektorowe, rekordy co 1151 bajtow (czarna + 256 kolorow palety);
+#  - tabela B: te same warstwy dla bitmap, rekordy co 1009 bajtow;
+#  - lista obiektow: naglowek obiektu, kolor warstwy, ramka i odcinki (linia / krzywa Beziera)
+#    albo osadzony plik BMP. Wspolrzedne w mm, os Y w gore (uklad stolu).
+
+RLD_MAGIC = b"\x0fRDFILEVER"
+_RLD_A = 1151
+_RLD_B = 1009
+_RLD_PALETTE = ("0000ff", "ff0000", "00ff00", "fa8072", "ffff00")
+_RLD_OBJ = re.compile(rb"[\x01\x02]\x00[\x01\x02]\x00\x00[\x01-\x20]\x00\x00\x00", re.S)
+_RLD_MIN_INTERVAL = 0.02  # mm; mniej to prawie zawsze blad wpisu (np. "0,15" w RDWorks)
+
+
+def is_rld(path):
+    try:
+        with open(str(path), "rb") as fh:
+            return fh.read(len(RLD_MAGIC)) == RLD_MAGIC
+    except OSError:
+        return False
+
+
+def _rld_tables(d):
+    """Polozenie tabel A i B (po kolorach palety, ktore RDWorks ma zawsze te same)."""
+    pal = [bytes.fromhex(c) for c in _RLD_PALETTE]
+    start = 0
+    while True:
+        p = d.find(pal[0], start, 20000)
+        if p < 0:
+            raise ValueError(_("nie rozpoznano tabeli warstw RDWorks (nieobsługiwana wersja pliku)"))
+        if all(d[p + _RLD_A * k:p + _RLD_A * k + 3] == pal[k] for k in range(len(pal))):
+            a0 = p - 327
+            break
+        start = p + 1
+    b0 = a0 + 256 * _RLD_A + 26
+    if a0 - _RLD_A < 0 or b0 + 256 * _RLD_B > len(d) or not all(
+            d[b0 + _RLD_B * k + 159:b0 + _RLD_B * k + 162] == pal[k] for k in range(len(pal))):
+        raise ValueError(_("nie rozpoznano tabeli warstw bitmap RDWorks (nieobsługiwana wersja pliku)"))
+    return a0, b0
+
+
+def _fin(v):
+    return v == v and abs(v) < 1e6
+
+
+def _rld_f64(d, off, default=None):
+    try:
+        v = struct.unpack_from("<d", d, off)[0]
+    except struct.error:
+        return default
+    return v if _fin(v) else default
+
+
+def _rld_i32(d, off, default=0):
+    try:
+        return struct.unpack_from("<i", d, off)[0]
+    except struct.error:
+        return default
+
+
+def _rld_layers(d, a0, b0):
+    """{kolor 'rrggbb': (indeks palety, rekord A, rekord B)}. Czarna warstwa ma indeks -1."""
+    out = {}
+    for k in range(-1, 256):
+        base = a0 + _RLD_A * k
+        col = d[base + 327:base + 330].hex()
+        if col in out:
+            continue
+        out[col] = (k, base, b0 + _RLD_B * k if k >= 0 else None)
+    return out
+
+
+def _rld_speed(d, off, warn):
+    v = _rld_f64(d, off, None)
+    if v is None or not 0 < v <= 20000:
+        warn(_("nieprawidłowa prędkość warstwy RDWorks (%s): użyto 100 mm/s")
+             % ("?" if v is None else fmt(v)))
+        return 100.0
+    return v
+
+
+def _rld_vector_spec(d, base, warn):
+    """Parametry warstwy wektorowej (pola potwierdzone na plikach testowych)."""
+    speed = _rld_speed(d, base + 335, warn)
+    mn = _rld_f64(d, base + 343, 0.0)
+    mx = _rld_f64(d, base + 351, 0.0)
+    passes = _rld_i32(d, base + 623, 1) if d[base + 619] else 1
+    mode = d[base + _RLD_A]          # 1 = Cut, 0 = Scan
+    spec = {"kind": "fill" if mode == 0 else "cut", "power": max(0.0, min(100.0, mx)),
+            "min_power": max(0.0, min(100.0, min(mn, mx))), "speed": speed,
+            "passes": max(1, min(100, passes)), "off": 0 if d[base + 331] else 1,
+            "air": 1 if d[base + 375] else 0, "kerf": 0.0}
+    if mode not in (0, 1):
+        spec["off"] = 1
+        warn(_("nieznany tryb obróbki RDWorks (%d): warstwa ma wyłączone wyjście, sprawdź ją "
+               "w LightBurnie") % mode)
+    if mode == 0:
+        iv = _rld_f64(d, base + _RLD_A + 17, 0.1)
+        spec.update({"interval": iv if iv and 0 < iv <= 2 else 0.1, "bidir": 1, "angle": 0.0,
+                     "cross": 0, "offset": 0})
+    return spec
+
+
+def _rld_bitmap_spec(d, base, gray_levels, warn):
+    """Parametry warstwy bitmapowej (tabela B)."""
+    speed = _rld_speed(d, base + 167, warn)
+    mn = _rld_f64(d, base + 175, 0.0)
+    mx = _rld_f64(d, base + 183, 0.0)
+    passes = _rld_i32(d, base + 455, 1) if d[base + 451] else 1
+    iv = _rld_f64(d, base + _RLD_B + 1, 0.1)
+    if any(_rld_i32(d, base + off) for off in (983, 987, 991)):
+        # trzy przelaczniki (Negative Engrave, Optimized Scan, Ramp Effect) w nieustalonej
+        # jeszcze kolejnosci: negatywu nie zgadujemy
+        warn(_("warstwa bitmapy ma włączone Negative Engrave, Optimized Scan albo Ramp Effect; "
+               "te ustawienia nie są jeszcze przenoszone, sprawdź negatyw w LightBurnie"))
+    return {"kind": "image", "power": max(0.0, min(100.0, mx)),
+            "min_power": max(0.0, min(100.0, min(mn, mx))), "speed": speed,
+            "passes": max(1, min(100, passes)), "off": 0 if d[base + 163] else 1,
+            "air": 1 if d[base + 207] else 0, "kerf": 0.0,
+            "interval": iv if iv and 0 < iv <= 2 else 0.1, "bidir": 1,
+            "dither": "threshold" if gray_levels <= 2 else "jarvis", "negative": 0}
+
+
+def _rld_bbox(d, o):
+    if o + 32 > len(d):
+        return None
+    x0, x1, y0, y1 = struct.unpack_from("<4d", d, o)
+    if not all(_fin(v) for v in (x0, x1, y0, y1)) or x1 < x0 or y1 < y0:
+        return None
+    return x0, x1, y0, y1
+
+
+def _rld_path(d, h, end):
+    """Obiekt wektorowy pod offsetem h albo None. Zwraca (kolor, odcinki, zamkniety, koniec)."""
+    box = _rld_bbox(d, h + 13)
+    if box is None:
+        return None
+    x0, x1, y0, y1 = box
+    o = h + 45
+    if o + 8 > end:
+        return None
+    closed, ns = struct.unpack_from("<ii", d, o)
+    o += 8
+    if closed not in (0, 1) or not (0 < ns <= 2000000) or o + 74 * ns > end:
+        return None
+    segs = []
+    size = (x1 - x0) + (y1 - y0)
+    tol = max(1e-3, size * 1e-6)
+    slack = max(1.0, size * 0.5)
+    for _k in range(ns):
+        t = struct.unpack_from("<H", d, o)[0]
+        v = struct.unpack_from("<8d", d, o + 6)
+        o += 74
+        # przy liniach punkty kontrolne to smieci z pamieci RDWorks: sprawdzamy tylko konce
+        if t not in (0, 3) or not all(_fin(x) for x in (v if t == 3 else v[:4])):
+            return None
+        if not (x0 - slack <= v[0] <= x1 + slack and y0 - slack <= v[1] <= y1 + slack):
+            return None
+        if segs and (abs(segs[-1][1][2] - v[0]) > tol or abs(segs[-1][1][3] - v[1]) > tol):
+            return None
+        segs.append((t, v))
+    return d[h + 9:h + 12].hex(), segs, bool(closed), o, tol
+
+
+def _png_bytes(w, h, ctype, raw):
+    import zlib
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def _gray_levels(lines):
+    """2, gdy obraz ma tylko czern i biel (dithering Threshold); 3, gdy ma inne odcienie."""
+    for ln in lines:
+        if ln.translate(None, b"\x00\xff"):
+            return 3
+    return 2
+
+
+def _rgb_png(w, h, rgb_rows):
+    """rgb_rows: lista (r, g, b) bajtow. Obraz bez kolorow zapisuje jako PNG w skali szarosci."""
+    if all(r == g == b for r, g, b in rgb_rows):
+        lines = [r for r, _g, _b in rgb_rows]
+        return (_png_bytes(w, h, 0, b"".join(b"\x00" + ln for ln in lines)), w, h,
+                _gray_levels(lines))
+    out = []
+    for r, g, b in rgb_rows:
+        line = bytearray(3 * w)
+        line[0::3], line[1::3], line[2::3] = r, g, b
+        out.append(b"\x00" + bytes(line))
+    return _png_bytes(w, h, 2, b"".join(out)), w, h, 256
+
+
+def _bmp_to_png(bmp):
+    """BMP (1/4/8 bit z paleta albo 24/32 bit, bez kompresji) -> PNG bez Pillow.
+    Zwraca (png, szerokosc, wysokosc, poziomy: 2 = tylko czern i biel, 3 = odcienie szarosci,
+    256 = kolorowy)."""
+    if bmp[:2] != b"BM" or len(bmp) < 54:
+        raise ValueError("bmp")
+    off = struct.unpack_from("<I", bmp, 10)[0]
+    hsz, w, h, _pl, bpp, comp = struct.unpack_from("<IiiHHI", bmp, 14)
+    if hsz < 40 or comp not in (0, 3) or w <= 0 or h == 0 or bpp not in (1, 4, 8, 24, 32) \
+            or w * abs(h) > 4e8:
+        raise ValueError("bmp")
+    alpha_mask = None
+    if comp == 3:
+        # BI_BITFIELDS: przyjmujemy tylko zwykly uklad B, G, R (+ A)
+        if bpp != 32 or len(bmp) < (70 if hsz >= 56 else 66) or \
+                struct.unpack_from("<III", bmp, 54) != (0xff0000, 0xff00, 0xff):
+            raise ValueError("bmp")
+        if hsz >= 56:
+            alpha_mask = struct.unpack_from("<I", bmp, 66)[0]
+            if alpha_mask not in (0, 0xff000000):
+                raise ValueError("bmp")
+    bottom_up = h > 0
+    h = abs(h)
+    stride = ((w * bpp + 31) // 32) * 4
+    if off + stride * h > len(bmp):
+        raise ValueError("bmp")
+    starts = [off + (h - 1 - y if bottom_up else y) * stride for y in range(h)]
+    if bpp > 8:
+        step = bpp // 8
+        pxs = [bmp[s:s + w * step] for s in starts]
+        use_alpha = False
+        if step == 4 and alpha_mask != 0:
+            # kanal alfa (decyzja dla calego obrazu, nie dla wiersza): przezroczyste piksele
+            # na bialo, inaczej zostalyby wypalone; sam zerowy kanal = brak alfy (XRGB)
+            alphas = [px[3::4] for px in pxs]
+            opaque = b"\xff" * w
+            use_alpha = any(any(a) for a in alphas) and any(a != opaque for a in alphas)
+        rgb = []
+        for i, px in enumerate(pxs):
+            b, g, r = px[0::step], px[1::step], px[2::step]
+            if use_alpha:
+                a = alphas[i]
+                r = bytes(255 - ((255 - c) * al) // 255 for c, al in zip(r, a))
+                g = bytes(255 - ((255 - c) * al) // 255 for c, al in zip(g, a))
+                b = bytes(255 - ((255 - c) * al) // 255 for c, al in zip(b, a))
+            rgb.append((r, g, b))
+        return _rgb_png(w, h, rgb)
+    n = struct.unpack_from("<I", bmp, 46)[0] or (1 << bpp)
+    pbase = 14 + hsz
+    pal = []
+    for i in range(min(n, 1 << bpp)):
+        b, g, r = bmp[pbase + 4 * i:pbase + 4 * i + 3].ljust(3, b"\x00")
+        pal.append((r, g, b))
+    while len(pal) < 256:
+        pal.append((0, 0, 0))
+    if bpp == 8:
+        idx_rows = [bmp[s:s + w] for s in starts]
+    else:
+        per = 8 // bpp
+        mask = (1 << bpp) - 1
+        table = [bytes((byte >> (8 - bpp * (k + 1))) & mask for k in range(per))
+                 for byte in range(256)]
+        idx_rows = [b"".join(table[c] for c in bmp[s:s + stride])[:w] for s in starts]
+    lr = bytes(p[0] for p in pal)
+    lg = bytes(p[1] for p in pal)
+    lb = bytes(p[2] for p in pal)
+    return _rgb_png(w, h, [(r.translate(lr), r.translate(lg), r.translate(lb)) for r in idx_rows])
+
+
+def read_rld(path, log):
+    """Projekt RDWorks (.rld) -> lista z jedna plansza."""
+    d = Path(path).read_bytes()
+    if not d.startswith(RLD_MAGIC):
+        raise ValueError(_("to nie jest plik RDWorks (.rld)"))
+    try:
+        return _read_rld(path, d, log)
+    except (struct.error, IndexError):
+        raise ValueError(_("uszkodzony plik RDWorks (.rld)"))
+
+
+def _read_rld(path, d, log):
+    ver = d[1:16].decode("ascii", "replace")
+    a0, b0 = _rld_tables(d)
+    layers = _rld_layers(d, a0, b0)
+    bed_w = _rld_f64(d, 20, 0.0) or 0.0
+    bed_h = _rld_f64(d, 28, 0.0) or 0.0
+    if not (0 < bed_h < 100000):
+        bed_h = 0.0
+    cv = Canvas(Path(path).stem)
+    cv.machine = "RDWorks %s%s" % (ver.replace("RDFILEVER", ""),
+                                   (", %s x %s mm" % (fmt(bed_w), fmt(bed_h))) if bed_h else "")
+    warned = set()
+
+    def warn(msg):
+        if msg not in warned:
+            warned.add(msg)
+            log(_("  UWAGA: ") + msg)
+
+    pos = b0 + 256 * _RLD_B
+    end = len(d)
+    specs = {}
+    unknown = set()
+    bad = 0
+    small_iv = set()
+    n = 0
+    while True:
+        m = _RLD_OBJ.search(d, pos)
+        if not m:
+            break
+        h = m.start()
+        if d[h] == 1:
+            r = _rld_path(d, h, end)
+            if r is None:
+                if _rld_bbox(d, h + 13) is not None:
+                    bad += 1
+                pos = h + 1
+                continue
+            col, segs, closed, pos, tol = r
+            sp = SubPath((segs[0][1][0], bed_h - segs[0][1][1]))
+            for t, v in segs:
+                if t == 3:
+                    sp.segs.append(("C", (v[4], bed_h - v[5]), (v[6], bed_h - v[7])))
+                else:
+                    sp.segs.append(("L", None, None))
+                sp.pts.append((v[2], bed_h - v[3]))
+            if closed:
+                if len(sp.pts) > 2 and abs(sp.pts[-1][0] - sp.pts[0][0]) <= tol \
+                        and abs(sp.pts[-1][1] - sp.pts[0][1]) <= tol:
+                    sp.pts.pop()          # ostatni punkt = pierwszy: LightBurn domyka sam
+                elif len(sp.pts) > 1:
+                    sp.segs.append(("L", None, None))  # domkniecie odcinkiem
+                sp.closed = len(sp.pts) > 1
+            it = Item()
+            it.kind = "path"
+            it.subpaths = [sp]
+            levels = 0
+        else:
+            o = h + 13
+            box = _rld_bbox(d, o)
+            if box is None or o + 38 > end or d[o + 32:o + 34] != b"BM":
+                pos = h + 1
+                continue
+            x0, x1, y0, y1 = box
+            size = struct.unpack_from("<I", d, o + 34)[0]
+            if not (x1 > x0 and y1 > y0) or size < 54 or o + 32 + size > end:
+                bad += 1
+                pos = h + 1
+                continue
+            col = d[h + 9:h + 12].hex()
+            pos = o + 32 + size
+            try:
+                png, w, hh, levels = _bmp_to_png(d[o + 32:o + 32 + size])
+            except (ValueError, struct.error, IndexError):
+                warn(_("bitmapa w nieobsługiwanym formacie (np. skompresowana), pominięta"))
+                continue
+            it = Item()
+            it.kind = "bitmap"
+            it.png = png
+            it.ow, it.oh = w, hh
+            it.matrix = [(x1 - x0) / w, 0, 0, (y1 - y0) / hh, x0, bed_h - y1]
+        n += 1
+        it.id = "rld%d" % n
+        it.layer = "#" + col
+        it.zorder = n
+        it.ptype = "RLD"
+        lay = layers.get(col)
+        if lay is None:
+            unknown.add(col)
+            spec = {"kind": "image" if it.kind == "bitmap" else "cut", "power": 0.0,
+                    "min_power": 0.0, "speed": 100.0, "passes": 1, "off": 1, "kerf": 0.0}
+            if it.kind == "bitmap":
+                spec.update({"interval": 0.1, "bidir": 1, "dither": "jarvis", "negative": 0})
+        elif it.kind == "bitmap":
+            if lay[2] is None:
+                warn(_("bitmapa na czarnej warstwie: parametry warstwy bitmapowej nie są jeszcze "
+                       "rozpoznane, użyto parametrów wektorowych tej warstwy"))
+                spec = _rld_vector_spec(d, lay[1], warn)
+                spec.update({"kind": "image", "interval": spec.get("interval", 0.1), "bidir": 1,
+                             "dither": "threshold" if levels <= 2 else "jarvis", "negative": 0})
+                for k in ("angle", "cross", "offset"):
+                    spec.pop(k, None)
+            else:
+                spec = _rld_bitmap_spec(d, lay[2], levels, warn)
+        else:
+            spec = _rld_vector_spec(d, lay[1], warn)
+        if spec.get("interval") is not None and spec["interval"] < _RLD_MIN_INTERVAL:
+            small_iv.add("#%s %s mm" % (col, fmt(spec["interval"])))
+        it.rd_spec = spec
+        cv.layers.setdefault(it.layer, {"name": it.layer, "order": lay[0] if lay else 999,
+                                        "visible": True})
+        cv.items.append(it)
+        specs[(col, spec["kind"])] = spec
+    if unknown:
+        warn(_("obiekty na warstwach spoza palety RDWorks (%s): wyłączone wyjście i moc 0")
+             % ", ".join("#" + c for c in sorted(unknown)))
+    if small_iv:
+        warn(_("bardzo mały odstęp linii (%s); sprawdź wartość w RDWorks (\"0,15\" z przecinkiem "
+               "RDWorks zapisuje jako 0,0025)") % ", ".join(sorted(small_iv)))
+    if bad:
+        warn(_("nie dało się odczytać części obiektów (%d; plik uszkodzony lub ucięty albo nieznany "
+               "typ obiektu); sprawdź projekt") % bad)
+    if not cv.items:
+        warn(_("w pliku RDWorks nie znaleziono obiektów"))
+    if cv.items:
+        log(_("  RDWorks: liczba obiektów %d, warstwy: %s") % (len(cv.items), ", ".join(
+            "#%s %s" % (c, _(OP_LABEL[k])) for c, k in specs)))
+    return [cv]
+
+
 def read_project(path, log):
     p = str(path)
+    if is_rld(p):
+        return read_rld(p, log)
+    if p.lower().endswith(".rld"):
+        raise ValueError(_("nieobsługiwana wersja pliku RDWorks (.rld)"))
     if zipfile.is_zipfile(p):
         return read_xs(p, log)
     with open(p, "rb") as fh:
@@ -1344,6 +1758,13 @@ def layer_spec(it, log, warned, material=None):
             warned.add(msg)
             log(_("  UWAGA: ") + msg)
 
+    rd = getattr(it, "rd_spec", None)
+    if rd is not None:
+        # RDWorks: parametry warstwy odczytane wprost z pliku
+        spec = dict(rd)
+        if material is not None:
+            apply_material(spec, material, warn)
+        return spec
     pt = it.ptype
     p = it.params or {}
     kind = {"VECTOR_CUTTING": "cut", "VECTOR_ENGRAVING": "line",
@@ -1859,7 +2280,8 @@ def convert_canvas(cv, log, flip_x=False, flip_y=True, material=None, overrides=
                           '        <Children>\n' + "".join(groups[val]) +
                           '        </Children>\n'
                           '    </Shape>\n')
-    note = _("Przekonwertowano z xTool Studio (xs2lightburn %s)") % VERSION
+    note = _("Przekonwertowano z %s (xs2lightburn %s)") % (
+        "RDWorks" if (cv.machine or "").startswith("RDWorks") else "xTool Studio", VERSION)
     # Naglowek MirrorX/MirrorY = ustawienia urzadzenia LightBurn, z ktorych wynika odbicie:
     # MirrorX -> odbicie X; brak MirrorY -> os Y w gore (odbicie Y wzgledem xTool).
     xml = (
@@ -1902,7 +2324,7 @@ def friendly_error(e):
     if isinstance(e, zipfile.BadZipFile):
         return _("uszkodzony plik .xs (archiwum ZIP nie daje się odczytać)")
     if isinstance(e, (json.JSONDecodeError, UnicodeDecodeError)):
-        return _("to nie jest poprawny plik .xs/.xcs (uszkodzone dane JSON)")
+        return _("to nie jest poprawny plik .xs/.xcs/.rld (uszkodzone dane)")
     if isinstance(e, KeyError):
         return _("w pliku brakuje wymaganej części: %s") % e
     if isinstance(e, PermissionError):
@@ -1919,7 +2341,7 @@ def convert_file(path, out_dir, log, flip_x=False, flip_y=True, overwrite=False,
     path = Path(path)
     log(_("Plik: %s") % path)
     log(_("  Materiał: %s") % (material["name"] if material else
-                            _("nie wybrano (parametry przeniesione z xTool)")))
+                            _("nie wybrano (parametry przeniesione z projektu)")))
     if not path.is_file():
         raise ValueError(_("nie ma takiego pliku"))
     canvases = read_project(path, log)
@@ -3184,7 +3606,7 @@ def build_gui(root, on_lang=None, keep=None):
     from tkinter import filedialog, messagebox, ttk
 
     cfg = load_config()
-    root.title(_("xs2lightburn %s  (xTool Studio -> LightBurn)") % VERSION)
+    root.title(_("xs2lightburn %s  (xTool Studio / RDWorks -> LightBurn)") % VERSION)
     sw, sh_ = root.winfo_screenwidth(), root.winfo_screenheight()
     if keep and keep.get("geometry"):
         root.geometry(keep["geometry"])  # przebudowa po zmianie jezyka: ten sam rozmiar okna
@@ -3238,7 +3660,7 @@ def build_gui(root, on_lang=None, keep=None):
 
     lcb.bind("<<ComboboxSelected>>", on_lang_change)
 
-    ttk.Label(frm, text=_("Pliki (.xs, .xcs); kliknij plik, żeby go podejrzeć:")).pack(anchor="w")
+    ttk.Label(frm, text=_("Pliki (.xs, .xcs, .rld); kliknij plik, żeby go podejrzeć:")).pack(anchor="w")
     lb = tk.Listbox(frm, height=8, selectmode="extended", exportselection=False)
     lb.pack(fill="x")
 
@@ -3258,9 +3680,10 @@ def build_gui(root, on_lang=None, keep=None):
 
     def add_files():
         sel = filedialog.askopenfilenames(
-            title=_("Wybierz pliki xTool"),
+            title=_("Wybierz pliki projektów"),
             initialdir=cfg.get("in_dir") or str(Path.home()),
-            filetypes=[(_("Projekty xTool"), "*.xs *.xcs"), (_("Wszystkie pliki"), "*.*")])
+            filetypes=[(_("Projekty xTool i RDWorks"), "*.xs *.xcs *.rld"),
+                       (_("Wszystkie pliki"), "*.*")])
         if sel:
             cfg["in_dir"] = str(Path(sel[0]).parent)
             save_config(cfg)
@@ -3283,7 +3706,7 @@ def build_gui(root, on_lang=None, keep=None):
     ttk.Button(bar, text=_("Dodaj pliki..."), command=add_files).pack(side="left")
     ttk.Button(bar, text=_("Usuń zaznaczone"), command=remove_sel).pack(side="left", padx=6)
 
-    ttk.Label(frm, text=_("Folder zapisu (puste = ten sam folder co plik xTool):")).pack(
+    ttk.Label(frm, text=_("Folder zapisu (puste = ten sam folder co plik źródłowy):")).pack(
         anchor="w", pady=(8, 0))
     keep = keep or {}
     outvar = tk.StringVar(value=keep.get("out_dir", cfg.get("out_dir", "")))
@@ -3300,7 +3723,7 @@ def build_gui(root, on_lang=None, keep=None):
 
     ttk.Button(orow, text=_("Wybierz..."), command=pick_out).pack(side="left", padx=6)
 
-    NO_MAT = _("(bez zmian: parametry z xTool)")
+    NO_MAT = _("(bez zmian: parametry z projektu)")
     skipped = []
     broken = keep.get("broken", False)
     try:
@@ -3427,7 +3850,7 @@ def build_gui(root, on_lang=None, keep=None):
     ttk.Button(tbar, text=_("Dopasuj widok"), command=lambda: prev.fit()).pack(side="right")
     cvsel = ttk.Combobox(tbar, state="readonly", width=24)
     ttk.Label(top, text=_("Kółko myszy: powiększ / pomniejsz.  Przeciągnij: przesuń.  "
-                        "Dwuklik: dopasuj.  Układ jak w xTool."),
+                        "Dwuklik: dopasuj.  Układ jak w programie źródłowym."),
               foreground="#555", padding=(6, 0)).pack(anchor="w")
     prev = PreviewCanvas(top)
     prev.cvs.pack(fill="both", expand=True)
@@ -3435,7 +3858,7 @@ def build_gui(root, on_lang=None, keep=None):
     # ---------------- prawa strona: warstwy i edycja
     bot = ttk.Frame(right, padding=(6, 4))
     right.add(bot, weight=2)
-    cols = (_("Warstwa"), _("Kolor xTool"), _("Operacja"), _("Moc min %"), _("Moc max %"), "mm/s",
+    cols = (_("Warstwa"), _("Kolor źródła"), _("Operacja"), _("Moc min %"), _("Moc max %"), "mm/s",
             _("Przejścia"), _("Odstęp linii"), _("Kąt"), "Dither", _("Kerf mm"), _("Dmuch"), _("Wyjście"),
             _("Elementy"))
     widths = (65, 75, 105, 72, 72, 55, 65, 140, 65, 65, 60, 50, 110, 65)
@@ -3455,7 +3878,7 @@ def build_gui(root, on_lang=None, keep=None):
               text=_("Warstwa = numer w LightBurnie, * = zmienione ręcznie. Kolory na rysunku = "
                    "kolory warstw LightBurna, szare przerywane = wyjście wyłączone. Zaznacz "
                    "warstwę, zmień parametry poniżej i kliknij Zastosuj. Zmiany dotyczą tylko "
-                   "tego pliku i obecnego wyboru materiału; po zmianie pliku w xTool "
+                   "tego pliku i obecnego wyboru materiału; po zmianie pliku źródłowego "
                    "trzeba je zrobić od nowa.")).pack(anchor="w", pady=(4, 2))
     ed = ttk.LabelFrame(bot, text=_("Parametry zaznaczonej warstwy"), padding=6)
     ed.pack(fill="x")
@@ -3558,8 +3981,8 @@ def build_gui(root, on_lang=None, keep=None):
         name, machine, plan, real_i = res[ci]
         ov = ov_for(ctx, real_i)
         layers = [effective_layer(L, ov.get(L["idx"])) for L in plan.layers]
-        info.configure(text=_("%s    Maszyna xTool: %s    Materiał: %s    Warstw: %d")
-                       % (Path(f).name, machine or "?", ctx[1] or _("nie wybrano (parametry z xTool)"),
+        info.configure(text=_("%s    Maszyna: %s    Materiał: %s    Warstw: %d")
+                       % (Path(f).name, machine or "?", ctx[1] or _("nie wybrano (parametry z projektu)"),
                           len(layers)))
         sel = tree.selection()
         tree.delete(*tree.get_children())
@@ -3578,7 +4001,7 @@ def build_gui(root, on_lang=None, keep=None):
         load_fields()
 
     def analyze_work(ctx, f, mat):
-        log(_("Podgląd: %s (materiał: %s)") % (Path(f).name, ctx[1] or _("brak, parametry z xTool")))
+        log(_("Podgląd: %s (materiał: %s)") % (Path(f).name, ctx[1] or _("brak, parametry z projektu")))
         try:
             res = analyze_file(f, log, ctx[2], ctx[3], mat)
         except Exception as e:
@@ -3857,7 +4280,7 @@ def build_gui(root, on_lang=None, keep=None):
         log_box.see("end")
         log_box.configure(state="disabled")
     else:
-        log(_("Dodaj pliki .xs lub .xcs. Kliknij plik, żeby zobaczyć podgląd i warstwy."))
+        log(_("Dodaj pliki .xs, .xcs lub .rld. Kliknij plik, żeby zobaczyć podgląd i warstwy."))
     app.update({"lb": lb, "tree": tree, "prev": prev, "ev": ev, "airv": airv, "outv": outv,
                 "apply": apply_edit, "add_paths": add_paths, "start": start, "matvar": matvar,
                 "mstate": mstate, "context": context, "log_box": log_box, "on_mat": on_mat,
@@ -3923,7 +4346,7 @@ def run_console(args):
     cfg = load_config()
     files = list(args.files)
     if not files:
-        print(_("Podaj ścieżkę do pliku .xs lub .xcs (pusta linia = koniec):"))
+        print(_("Podaj ścieżkę do pliku .xs, .xcs lub .rld (pusta linia = koniec):"))
         while True:
             s = input("> ").strip().strip('"')
             if not s:
@@ -3931,7 +4354,7 @@ def run_console(args):
             files.append(s)
     out = args.out
     if out is None and files and not args.files:
-        s = input(_("Folder zapisu (Enter = obok pliku xTool): ")).strip().strip('"')
+        s = input(_("Folder zapisu (Enter = obok pliku źródłowego): ")).strip().strip('"')
         out = s or None
     mx, my = mirror_settings(cfg)
     if args.mirror_x is not None:
@@ -4004,7 +4427,7 @@ def main(argv=None):
         print("language '%s' not available, using '%s'" % (lang, used), file=sys.stderr)
     for w in LOCALE_WARNINGS:
         print("locales: " + w, file=sys.stderr)
-    ap = argparse.ArgumentParser(description=_("xTool Studio (.xs/.xcs) -> LightBurn (.lbrn2)"))
+    ap = argparse.ArgumentParser(description=_("xTool Studio (.xs/.xcs) / RDWorks (.rld) -> LightBurn (.lbrn2)"))
     ap.add_argument("files", nargs="*")
     ap.add_argument("-o", "--out", default=None, help=_("folder zapisu"))
     ap.add_argument("--nogui", action="store_true", help=_("tryb konsolowy"))
