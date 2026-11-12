@@ -12,12 +12,13 @@ versions follow [Semantic Versioning](https://semver.org/).
   its REST API, without saving a file. Console: `--lightburn open` / `--lightburn import`.
   One-time approval in LightBurn; the secret is stored in `~/.xs2lightburn_lightburn.json`
   (owner-only permissions on Linux/macOS).
-
-### Changed
-- Settings are saved atomically, so an interrupted save cannot leave a damaged settings file.
 - Material import from LightBurn libraries: *Import...* now also reads `.clb` files, and
   *From LightBurn...* imports the library selected in a running LightBurn 2.2+
   (values converted from LightBurn's display units).
+
+### Changed
+- Settings are saved atomically, so an interrupted save cannot leave a damaged settings file.
+- With `--lightburn`, the console exits with code 1 when a conversion or the transfer fails.
 
 ## [2.0] - 2026-11-11
 
