@@ -4,6 +4,21 @@ All notable changes to this project are listed here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [2.1] - 2026-11-12
+
+### Added
+- *Open in LightBurn* and *Add to LightBurn project* buttons: the previewed design (with the
+  chosen material, mirror settings and layer edits) is sent to a running LightBurn 2.2+ through
+  its REST API, without saving a file. Console: `--lightburn open` / `--lightburn import`.
+  One-time approval in LightBurn; the secret is stored in `~/.xs2lightburn_lightburn.json`
+  (owner-only permissions on Linux/macOS).
+
+### Changed
+- Settings are saved atomically, so an interrupted save cannot leave a damaged settings file.
+- Material import from LightBurn libraries: *Import...* now also reads `.clb` files, and
+  *From LightBurn...* imports the library selected in a running LightBurn 2.2+
+  (values converted from LightBurn's display units).
+
 ## [2.0] - 2026-11-11
 
 First public release.

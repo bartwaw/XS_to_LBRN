@@ -18,6 +18,8 @@ keeping layers and laser operations, not just the geometry.
 - Optional **material database**: pick a material and its parameters replace the xTool ones.
 - English and Polish interface (switch in the window, or `--lang en|pl`). More languages can be
   added as files in `locales/` (see [Adding a language](#adding-a-language)).
+- **Open in LightBurn** with one click, and import material settings from a LightBurn library
+  (`.clb` file or the library selected in a running LightBurn 2.2+).
 - Console mode for batch conversion.
 
 Operation mapping:
@@ -37,6 +39,8 @@ Line density in xTool (lines/cm) becomes the LightBurn interval: `interval mm = 
 - Optional: [Pillow](https://pypi.org/project/Pillow/) (`pip install pillow`), used to mirror
   bitmap pixels, to read image formats other than PNG/JPG and to show images in the preview.
   Without it PNG/JPG images are still converted (other formats are skipped with a warning).
+- Optional: LightBurn 2.2 or newer for *Open in LightBurn* and *From LightBurn...*
+  (everything else works with any LightBurn version that opens `.lbrn2` files).
 
 Download the repository (*Code > Download ZIP*) and keep the `locales` folder next to
 `xs2lightburn.py`. Without that folder the program still works, but only in Polish.
@@ -55,16 +59,44 @@ python xs2lightburn.py
    (LightBurn: *Edit > Device Settings > Mirror X / Mirror Y*).
 4. Optionally select a layer, change its parameters and click *Apply*.
 5. Click *Convert all files in the list*. The `.lbrn2` file is saved next to the xTool file
-   or in the chosen output folder.
+   or in the chosen output folder. Or send the previewed design straight to LightBurn with
+   *Open in LightBurn* / *Add to LightBurn project* (see below).
 
 Console:
 
 ```
 python xs2lightburn.py project.xs other.xcs -o out_folder
 python xs2lightburn.py project.xs --mirror-x --mirror-y --material "Example: birch plywood 3 mm"
+python xs2lightburn.py project.xs --lightburn open      # convert, then open it in LightBurn
+python xs2lightburn.py a.xs b.xs --lightburn import     # convert, add all to the open project
 python xs2lightburn.py --list-materials
 python xs2lightburn.py --help
 ```
+
+## Working with a running LightBurn (2.2 or newer)
+
+LightBurn 2.2 has a local REST API, switched on by default. The converter uses it for two
+things; everything else works without it.
+
+- **Open in LightBurn** sends the design shown in the preview (with the chosen material,
+  mirror settings and layer edits) to LightBurn as a new project. If the project open in
+  LightBurn has unsaved changes, LightBurn asks whether to save them first.
+  **Add to LightBurn project** adds it to the current project instead. Nothing is written to disk: save the project in LightBurn
+  (*File > Save*), or use *Convert* to get the `.lbrn2` file.
+- **Edit database... > From LightBurn...** imports the material library selected in LightBurn
+  (*Library* window, *Select Library*). Values are converted from LightBurn's display units
+  to mm and mm/s.
+
+The first time, LightBurn shows a window asking you to approve "xs2lightburn"; you have
+30 seconds. The program asks for read-only project and machine state and file upload. The
+read-only project permission also covers LightBurn's camera image; this program does not read
+it, and it cannot start a job. The approval is remembered as a secret in
+`~/.xs2lightburn_lightburn.json`; treat that file like a password. To withdraw it, use
+*Manage API Security* in LightBurn's *Settings > Extensions*. The program pairs again
+when the secret no longer works.
+
+The API listens on this computer only (`http://127.0.0.1:19520`). It is new and may change
+between LightBurn versions.
 
 ## Mirror X / Mirror Y
 
@@ -78,8 +110,17 @@ If the converted project opens mirrored, change the two checkboxes (or the `--mi
 Stored in `~/.xs2lightburn_materialy.json` (user folder). It starts with **three examples
 only**, taken from public tables for a 100 W CO2 laser. They are not tested on your machine.
 Example names are in English in both interface languages.
-Use *Edit database...* to add your own tested settings, or *Import...* a JSON file
-(for example one exported by another user). *Export...* saves your database to share it.
+Use *Edit database...* to add your own tested settings, or *Import...* a file:
+
+- a JSON file exported by this program (for example by another user);
+- a LightBurn library file (`.clb`), no LightBurn needed. Each material and thickness becomes
+  one entry. Settings without a thickness (for example an engrave or image preset) are added to
+  every thickness of that material. Vector presets without a thickness, or named like
+  "score" / "engrave", become *line engrave*; a second preset of the same kind gets its own
+  entry with the description in its name. Sub-layers are not imported.
+
+*From LightBurn...* does the same with the library selected in a running LightBurn.
+Imported values are not saved until you click *Save*. *Export...* saves your database to share it.
 
 Each material has a group, a name, a thickness and settings per operation (cut, line, fill,
 image). Operations a material does not define (for example cutting on an engrave-only
@@ -192,8 +233,26 @@ ponownie.
 Plik `~/.xs2lightburn_materialy.json` w folderze użytkownika. Na start zawiera **tylko trzy
 przykłady** z publicznych tabel dla lasera CO2 100 W, niesprawdzone na Twojej maszynie.
 Przykłady (nazwy i opisy) są po angielsku w obu wersjach językowych.
-*Edytuj bazę...* pozwala dopisać własne, sprawdzone parametry; *Importuj...* wczytuje plik JSON
-(np. wyeksportowany przez kogoś innego), *Eksportuj...* zapisuje bazę do udostępnienia.
+*Edytuj bazę...* pozwala dopisać własne, sprawdzone parametry. *Importuj...* wczytuje plik JSON
+z tego programu (np. od kogoś innego) albo bibliotekę LightBurna (`.clb`), bez uruchamiania
+LightBurna. Każdy materiał i grubość z biblioteki to jeden wpis; ustawienia bez grubości (grawer,
+obraz) dochodzą do każdej grubości tego materiału. *Z LightBurna...* robi to samo z biblioteką
+wybraną w działającym LightBurnie 2.2+. Zaimportowane wartości trafiają do bazy po kliknięciu
+*Zapisz*. *Eksportuj...* zapisuje bazę do udostępnienia.
+
+### Praca z działającym LightBurnem (2.2 i nowsze)
+
+LightBurn 2.2 ma lokalne REST API, domyślnie włączone. *Otwórz w LightBurnie* wysyła projekt
+z podglądu (z materiałem, odbiciami i zmianami warstw) do LightBurna jako nowy projekt; gdy
+w LightBurnie są niezapisane zmiany, LightBurn sam zapyta o ich zapis. *Wstaw do projektu w LightBurnie*
+dodaje go do bieżącego projektu. Nic nie jest zapisywane na dysk: zapisz projekt w LightBurnie
+(*File > Save*) albo użyj konwersji. W konsoli: `--lightburn open` albo `--lightburn import`.
+
+Za pierwszym razem LightBurn pokazuje okno z prośbą o zgodę dla "xs2lightburn" (30 sekund).
+Program prosi o odczyt projektu i stanu maszyny oraz wysyłanie plików. Uprawnienie do odczytu
+projektu obejmuje też obraz z kamery LightBurna, ale program go nie czyta; nie może też uruchomić
+zadania. Zgoda jest zapamiętana jako sekret w `~/.xs2lightburn_lightburn.json` (traktuj ten plik
+jak hasło). Cofniesz ją w LightBurnie: *Settings > Extensions > Manage API Security*.
 
 ### Ograniczenia
 

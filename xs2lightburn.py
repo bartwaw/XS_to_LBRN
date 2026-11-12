@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xs2lightburn 2.0
+xs2lightburn 2.1
 Converts xTool Studio projects (.xs, .xcs) to LightBurn projects (.lbrn2).
 Konwerter projektów xTool Studio (.xs, .xcs) do projektów LightBurn (.lbrn2).
 
@@ -28,7 +28,7 @@ import zipfile
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
-VERSION = "2.0"
+VERSION = "2.1"
 MAX_ENTRY_BYTES = 100 * 1024 * 1024   # zabezpieczenie przed archiwum-bomba
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 
@@ -222,7 +222,12 @@ def system_lang():
 def load_config():
     try:
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return cfg if isinstance(cfg, dict) else {}
+        if not isinstance(cfg, dict):
+            return {}
+        if "lightburn_secret" in cfg:  # wersje rozwojowe trzymaly tu sekret: usuwamy od razu
+            cfg.pop("lightburn_secret", None)
+            save_config(cfg)
+        return cfg
     except Exception:
         return {}
 
@@ -252,11 +257,51 @@ def mirror_to_flip(mx, my):
     return bool(mx), not bool(my)
 
 
-def save_config(cfg):
+_FILE_LOCK = threading.RLock()  # zapisy konfiguracji i sekretu z kilku watkow
+
+
+def _write_private(path, text, private=False):
+    """Zapis atomowy: unikalny plik tymczasowy obok celu i zamiana. private: prawa 0600
+    od poczatku (POSIX); inaczej zwykle prawa jak przy nowym pliku."""
+    import tempfile
+    import time
+    path = Path(os.path.realpath(str(path)))  # dowiazanie (np. dotfiles) zostaje dowiazaniem
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if not private:
+            # prawa istniejacego pliku albo zwykle 0644 (os.umask jest wspolny dla watkow: nie ruszamy)
+            try:
+                mode = os.stat(str(path)).st_mode & 0o777
+            except OSError:
+                mode = 0o644
+            os.chmod(tmp, mode)
+        for attempt in range(4):
+            try:
+                os.replace(tmp, str(path))
+                return
+            except PermissionError:
+                # Windows: cel chwilowo otwarty (antywirus, indeksowanie, druga kopia programu)
+                if os.name != "nt" or attempt == 3:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_config(cfg):
+    with _FILE_LOCK:
+        try:
+            _write_private(CONFIG_PATH, json.dumps(dict(cfg), indent=2))
+        except Exception:
+            pass
 
 
 def fmt(v):
@@ -1889,8 +1934,7 @@ def convert_file(path, out_dir, log, flip_x=False, flip_y=True, overwrite=False,
         if not nshapes:
             log(_("  plansza '%s': brak elementów do zapisu") % cv.name)
             continue
-        suffix = "" if len(canvases) == 1 else "_%d_%s" % (i + 1, safe_stem(cv.file_name))
-        target = out_dir / (path.stem + suffix + ".lbrn2")
+        target = out_dir / output_name(path, i, len(canvases), cv)
         if not overwrite:
             target = unique_path(target)
         write_atomic(target, xml)
@@ -1905,6 +1949,526 @@ def convert_file(path, out_dir, log, flip_x=False, flip_y=True, overwrite=False,
                 extra += ", dither %s" % sp["dither"]
             log(_("    C%02d  %s, przejść %d%s") % (idx, nm, sp["passes"], extra))
     return written
+
+
+# ----------------------------------------------------------------------------
+# Biblioteki materialow LightBurna (.clb i REST API) -> baza konwertera
+# ----------------------------------------------------------------------------
+
+# cale slowa: "Cut outline" albo "linia ciecia" to nadal ciecie
+_LINE_WORDS = re.compile(r"\b(scor\w*|mark|marking|engrav\w*|etch\w*|grawer\w*|znakow\w*)\b",
+                         re.I)
+
+
+def _lib_kind(ltype, thick, label):
+    """Operacja konwertera dla wpisu biblioteki: cut, line, fill, image albo None."""
+    t = re.sub(r"[^a-z]", "", str(ltype or "").lower())
+    if t == "image":
+        return "image"
+    if t in ("scan", "offset", "fill", "offsetfill"):
+        return "fill"
+    if t == "cut":
+        # wektor bez grubosci materialu albo opisany jako grawer/znakowanie = grawer linia
+        return "line" if thick is None or _LINE_WORDS.search(label or "") else "cut"
+    return None
+
+
+def _lib_thick(v):
+    t = _num(v, -1.0)
+    return t if t > 0 else None
+
+
+def library_to_profiles(entries, libname, source):
+    """Wpisy biblioteki LightBurna -> (profile bazy, pominiete).
+    entries: [{"material", "thick" (None = bez grubosci), "label", "type", "op"}].
+    Profil = material i grubosc; wpisy bez grubosci (np. grawer) dochodza do kazdej grubosci."""
+    skipped = []
+    group = "LightBurn: %s" % libname if libname else "LightBurn"
+    by_mat = {}
+    for e in entries:
+        by_mat.setdefault(str(e.get("material") or "").strip() or "?", []).append(e)
+    profiles = []
+    used = set()
+
+    def unique(name):
+        base, i = name, 2
+        while name in used:
+            name, i = "%s %d" % (base, i), i + 1
+        used.add(name)
+        return name
+
+    for mat, es in by_mat.items():
+        shared = [e for e in es if e.get("thick") is None]
+        thicks = []
+        for e in es:
+            if e.get("thick") is not None and e["thick"] not in thicks:
+                thicks.append(e["thick"])
+        buckets = [(t, [e for e in es if e.get("thick") == t]) for t in sorted(thicks)]
+        if not buckets:
+            buckets = [(None, [])]
+        # wpisy bez grubosci: wspolne dla kazdej grubosci; ich wlasne dublety -> osobne profile
+        shared_ops, extra = {}, []
+        for e in shared:
+            k = _lib_kind(e.get("type"), None, e.get("label"))
+            op = _clean_op(e.get("op"), k) if k else None
+            if k is None:
+                skipped.append("%s: %s (%s)" % (mat, e.get("label") or "?",
+                                                _("nieobsługiwany typ warstwy")))
+            elif op is None:
+                skipped.append("%s: %s (%s)" % (mat, e.get("label") or "?", _("złe wartości")))
+            elif k in shared_ops:
+                extra.append((None, k, op, e))
+            else:
+                shared_ops[k] = (op, e)
+        for t, bes in buckets:
+            name = mat if t is None else "%s %s mm" % (mat, fmt(t))
+            ops = {}
+            for e in bes:
+                k = _lib_kind(e.get("type"), t, e.get("label"))
+                op = _clean_op(e.get("op"), k) if k else None
+                if k is None:
+                    skipped.append("%s: %s (%s)" % (name, e.get("label") or "?",
+                                                    _("nieobsługiwany typ warstwy")))
+                elif op is None:
+                    skipped.append("%s: %s (%s)" % (name, e.get("label") or "?", _("złe wartości")))
+                elif k in ops:
+                    extra.append((t, k, op, e))
+                else:
+                    ops[k] = (op, e)
+            for k, v in shared_ops.items():
+                ops.setdefault(k, v)
+            if not ops:
+                continue
+            notes = "; ".join("%s: %s" % (k, v[1].get("label")) for k, v in ops.items()
+                              if v[1].get("label"))
+            profiles.append(clean_profile(_p(group, unique(name), t or 0.0,
+                                             {k: v[0] for k, v in ops.items()}, notes, source)))
+        # kolejny wpis tej samej operacji (np. dwa ciecia 3 mm): osobny profil z opisem w nazwie
+        for t, k, op, e in extra:
+            base = mat if t is None else "%s %s mm" % (mat, fmt(t))
+            ops = {k: op}
+            for k2, v in shared_ops.items():
+                if k2 != k:
+                    ops.setdefault(k2, v[0])
+            label = e.get("label") or k
+            profiles.append(clean_profile(_p(group, unique("%s (%s)" % (base, label)), t or 0.0,
+                                             ops, "%s: %s" % (k, label), source)))
+    return [p for p in profiles if p], skipped
+
+
+def clb_entries(data):
+    """Wpisy z pliku biblioteki LightBurna (.clb, XML). Zwraca (nazwa biblioteki, wpisy)."""
+    import xml.etree.ElementTree as ET
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8-sig")  # LightBurn zapisuje UTF-8
+        except UnicodeDecodeError:
+            raise ValueError(_("to nie jest plik biblioteki LightBurna (.clb)"))
+    # LightBurn nie uzywa DOCTYPE/ENTITY; odrzucenie chroni przed "billion laughs" na starym expat
+    if re.search(r"<!\s*(DOCTYPE|ENTITY)", data, re.I):
+        raise ValueError(_("plik .clb zawiera niedozwolone definicje XML"))
+    data = re.sub(r"^\s*<\?xml[^>]*\?>", "", data)  # deklaracja kodowania niepotrzebna dla str
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as e:
+        raise ValueError(_("to nie jest poprawny plik biblioteki LightBurna (.clb): %s") % e)
+    if root.tag != "LightBurnLibrary":
+        raise ValueError(_("to nie jest plik biblioteki LightBurna (.clb)"))
+    entries = []
+    for m in root.iter("Material"):
+        mat = m.get("name") or ""
+        for ent in m.findall("Entry"):
+            thick = _lib_thick(ent.get("Thickness"))
+            title = ent.get("NoThickTitle") or ""
+            desc = ent.get("Desc") or ""
+            label = " ".join(x for x in (title if thick is None else "", desc) if x).strip()
+            for cs in ent:
+                if cs.tag not in ("CutSetting", "CutSetting_Img"):
+                    continue
+                v = {c.tag: c.get("Value") for c in cs}
+                ltype = cs.get("type") or ("Image" if cs.tag == "CutSetting_Img" else "")
+                mx = _num(v.get("maxPower"), None)
+                op = {"speed": v.get("speed"), "max": mx,
+                      "min": min(_num(v.get("minPower"), mx if mx is not None else 0), mx)
+                      if mx is not None else None,
+                      "passes": v.get("numPasses", 1),
+                      "air": v.get("runBlower", "1") not in ("0", "False", "false")}
+                iv = _num(v.get("interval"), None)
+                if iv is None and _num(v.get("dpi"), 0) > 0:
+                    iv = round(25.4 / _num(v.get("dpi"), 254), 4)
+                if iv is not None:
+                    op["interval"] = iv
+                if v.get("ditherMode"):
+                    op["dither"] = v["ditherMode"]
+                if _num(v.get("kerf"), 0):
+                    op["kerf"] = _num(v.get("kerf"), 0)
+                entries.append({"material": mat, "thick": thick, "label": label,
+                                "type": ltype, "op": op})
+                break  # pierwszy zapis wpisu = warstwa glowna (podwarstwy pomijamy)
+    return root.get("DisplayName") or "", entries
+
+
+def clb_to_profiles(path):
+    """Plik .clb -> (profile, pominiete)."""
+    path = Path(path)
+    name, entries = clb_entries(path.read_bytes())
+    return library_to_profiles(entries, name or path.stem, _("biblioteka LightBurna %s") % path.name)
+
+
+_SPEED_TO_MMS = {"mm/s": 1.0, "mm/min": 1 / 60.0, "in/s": 25.4, "in/min": 25.4 / 60.0}
+
+
+def api_library_entries(lib, units):
+    """Odpowiedz GET /api/material-library + GET /api/units -> wpisy biblioteki.
+    Wartosci z API sa w jednostkach wyswietlania LightBurna; tu przeliczane na mm i mm/s."""
+    units = units if isinstance(units, dict) else {}
+    sp = _SPEED_TO_MMS.get(str(units.get("units") or "").strip())
+    dist = {"mm": 1.0, "in": 25.4}.get(str(units.get("distance_units") or "").strip())
+    if sp is None or dist is None:
+        # bez pewnych jednostek nie zgadujemy: zla jednostka to wielokrotnie inna energia
+        raise ValueError(_("LightBurn nie podał jednostek (prędkość: %s, odległość: %s); "
+                         "zaktualizuj LightBurna.") % (units.get("units"), units.get("distance_units")))
+    if not isinstance(lib, dict) or lib.get("product") != "lightburn":
+        raise ValueError(_("LightBurn zwrócił nieoczekiwaną odpowiedź (to nie jest biblioteka lasera)"))
+    entries = []
+    for e in lib.get("entries") or []:
+        if not isinstance(e, dict) or not isinstance(e.get("cut"), dict):
+            continue
+        cut = e["cut"]
+        prm = cut.get("params") if isinstance(cut.get("params"), dict) else {}
+        thick = _lib_thick(e.get("thickness"))
+        label = " ".join(x for x in ((e.get("no_thick_title") or "") if thick is None else "",
+                                     e.get("description") or "") if x).strip()
+        if cut.get("kind") == "image":
+            ltype = "image"
+        else:
+            ltype = cut.get("mode") or ""
+        mx = _num(prm.get("max_power"), None)
+        op = {"speed": _num(prm.get("speed"), 0) * sp, "max": mx,
+              "min": min(_num(prm.get("min_power"), mx), mx) if mx is not None else None,
+              "passes": prm.get("num_passes", 1)}
+        gantry = prm.get("gantry") if isinstance(prm.get("gantry"), dict) else {}
+        if "run_blower" in gantry:
+            op["air"] = bool(gantry.get("run_blower"))
+        if _num(prm.get("interval"), 0) > 0:
+            op["interval"] = _num(prm.get("interval"), 0) * dist
+        elif _num(prm.get("dpi"), 0) > 0:
+            op["interval"] = round(25.4 / _num(prm.get("dpi"), 254), 4)
+        if prm.get("dither_mode"):
+            op["dither"] = prm["dither_mode"]
+        if _num(prm.get("kerf"), 0):
+            op["kerf"] = _num(prm.get("kerf"), 0) * dist
+        entries.append({"material": e.get("material") or "", "thick": thick, "label": label,
+                        "type": ltype, "op": op})
+    return entries
+
+
+# ----------------------------------------------------------------------------
+# LightBurn REST API (LightBurn 2.2 i nowsze): otwieranie projektu, biblioteka
+# ----------------------------------------------------------------------------
+
+LB_URL = "http://127.0.0.1:19520"
+LB_APP_NAME = "xs2lightburn"
+# state: potwierdzenie importu; project: biblioteka materialow; upload: pliki.
+# Program nie czyta obrazu z kamery (GET /api/overlay), choc uprawnienie "project" go obejmuje.
+LB_CAPS = ["state", "project", "upload"]
+
+
+class LightBurnError(Exception):
+    """Blad komunikacji z LightBurnem; tekst jest gotowy dla uzytkownika."""
+
+    def __init__(self, msg, code=None):
+        Exception.__init__(self, msg)
+        self.code = code
+
+
+class LightBurnAuthError(LightBurnError):
+    pass
+
+
+def lb_token(secret, now=None):
+    """Token Bearer: hex(HMAC-SHA256(sekret, biezaca minuta Unix))."""
+    import hashlib
+    import hmac
+    import time
+    minute = int(time.time() if now is None else now) // 60
+    return hmac.new(secret.encode("utf-8"), str(minute).encode("ascii"),
+                    hashlib.sha256).hexdigest()
+
+
+def lb_url(cfg=None):
+    return str((cfg or {}).get("lightburn_url") or LB_URL).rstrip("/")
+
+
+def _lb_open(req, timeout):
+    import urllib.request
+    # LightBurn dziala lokalnie: zmienne HTTP_PROXY z otoczenia nie moga przekierowac zapytan
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
+def _lb_err_text(payload):
+    try:
+        return str(json.loads(payload.decode("utf-8")).get("error") or "")[:200]
+    except Exception:
+        return ""
+
+
+def lb_request(cfg, method, path, secret=None, body=None, headers=None, timeout=10):
+    """Zapytanie do LightBurna; zwraca (status, bajty). Bledy jako LightBurnError."""
+    import http.client
+    import socket
+    import urllib.error
+    import urllib.request
+    h = dict(headers or {})
+    if secret:
+        h["Authorization"] = "Bearer " + lb_token(secret)
+    data = body
+    if isinstance(body, (dict, list)):
+        data = json.dumps(body).encode("utf-8")
+        h.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(lb_url(cfg) + path, data=data, method=method, headers=h)
+    try:
+        with _lb_open(req, timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        detail = _lb_err_text(e.read() or b"")
+        if e.code == 401:
+            raise LightBurnAuthError(_("LightBurn odrzucił autoryzację."), 401)
+        raise LightBurnError(_("LightBurn zwrócił błąd %d%s") % (
+            e.code, (": " + detail) if detail else ""), e.code)
+    except (urllib.error.URLError, socket.timeout, OSError, http.client.HTTPException) as e:
+        reason = getattr(e, "reason", e)
+        raise LightBurnError(_("Brak połączenia z LightBurnem (%s). Uruchom LightBurn 2.2 lub "
+                             "nowszy; REST API jest w nim włączone domyślnie.") % reason)
+
+
+def lb_json(cfg, method, path, secret=None, body=None, timeout=10):
+    st, data = lb_request(cfg, method, path, secret, body, timeout=timeout)
+    try:
+        return json.loads(data.decode("utf-8")) if data else {}
+    except ValueError:
+        raise LightBurnError(_("LightBurn zwrócił nieoczekiwaną odpowiedź."))
+
+
+LB_SECRET_PATH = Path.home() / ".xs2lightburn_lightburn.json"  # sekrety (jak hasla), osobno
+_PAIR_LOCK = threading.Lock()  # jedno okno zgody naraz
+
+
+def _secrets_load():
+    try:
+        raw = json.loads(LB_SECRET_PATH.read_text(encoding="utf-8"))
+        sec = raw.get("secrets") if isinstance(raw, dict) else None
+        return {k: v for k, v in (sec or {}).items() if isinstance(v, str) and v}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def lb_secret(cfg):
+    """Zapamietany sekret dla adresu LightBurna z cfg (albo None)."""
+    with _FILE_LOCK:
+        return _secrets_load().get(lb_url(cfg))
+
+
+def lb_set_secret(cfg, secret):
+    """Zapisuje (albo usuwa, gdy secret=None) sekret dla adresu LightBurna."""
+    with _FILE_LOCK:
+        sec = _secrets_load()
+        if secret:
+            sec[lb_url(cfg)] = secret
+        else:
+            sec.pop(lb_url(cfg), None)
+        _write_private(LB_SECRET_PATH, json.dumps({"secrets": sec}, indent=2), private=True)
+
+
+def _lb_is_local(cfg):
+    import urllib.parse
+    host = (urllib.parse.urlsplit(lb_url(cfg)).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def lb_pair(cfg, log, old=None):
+    """Parowanie: LightBurn pokazuje okno zgody (30 s). Zwraca sekret i go zapamietuje.
+    old: sekret, ktory wlasnie nie zadzialal (inny watek mogl juz sparowac na nowo)."""
+    with _PAIR_LOCK:
+        cur = lb_secret(cfg)
+        if cur and cur != old:
+            return cur  # inny watek wlasnie sparowal
+        if cur and cur == old:
+            try:
+                lb_set_secret(cfg, None)
+            except OSError:
+                pass
+        log(_("LightBurn: zatwierdź połączenie programu xs2lightburn w oknie LightBurna (masz 30 s)."))
+        try:
+            res = lb_json(cfg, "POST", "/api/connect",
+                          body={"application_name": LB_APP_NAME, "capabilities": LB_CAPS},
+                          timeout=45)
+        except LightBurnError as e:
+            if e.code == 403 and not _lb_is_local(cfg):
+                raise LightBurnError(_("połączenie z LightBurnem można zatwierdzić tylko na komputerze, "
+                                     "na którym działa LightBurn."), 403)
+            if e.code == 403:
+                raise LightBurnError(_("połączenie nie zostało zatwierdzone w LightBurnie (odrzucone "
+                                     "albo minęło 30 s)."), 403)
+            raise
+        secret = res.get("secret") if isinstance(res, dict) else None
+        if not secret or not isinstance(secret, str):
+            raise LightBurnError(_("LightBurn zwrócił nieoczekiwaną odpowiedź."))
+        try:
+            lb_set_secret(cfg, secret)
+            log(_("LightBurn: połączenie zatwierdzone i zapamiętane."))
+        except OSError as e:
+            log(_("LightBurn: nie udało się zapamiętać połączenia (%s); przy następnym razie "
+                  "LightBurn znowu poprosi o zgodę.") % friendly_error(e))
+        return secret
+
+
+def lb_call(cfg, log, fn):
+    """fn(sekret) z automatycznym parowaniem. Przy 401: jeszcze raz z nowym tokenem (zmiana
+    minuty), potem ponowne parowanie."""
+    import time
+    secret = lb_secret(cfg)
+    if not secret:
+        return fn(lb_pair(cfg, log))
+    try:
+        return fn(secret)
+    except LightBurnAuthError:
+        pass
+    time.sleep(1)
+    try:
+        return fn(secret)
+    except LightBurnAuthError:
+        pass
+    log(_("LightBurn: zapamiętane połączenie wygasło albo zostało cofnięte; łączę ponownie."))
+    return fn(lb_pair(cfg, log, old=secret))
+
+
+def lb_material_profiles(cfg, log):
+    """Biblioteka wybrana w LightBurnie -> (profile, pominiete, nazwa biblioteki)."""
+    def get(secret):
+        units = lb_json(cfg, "GET", "/api/units", secret)
+        lib = lb_json(cfg, "GET", "/api/material-library", secret)
+        return units, lib
+    units, lib = lb_call(cfg, log, get)
+    name = str(lib.get("name") or "") if isinstance(lib, dict) else ""
+    entries = api_library_entries(lib, units)
+    if not entries:
+        raise LightBurnError(_("W LightBurnie nie jest wybrana żadna biblioteka materiałów albo jest "
+                             "pusta (okno Library, lista Select Library)."))
+    profs, skipped = library_to_profiles(entries, name or "LightBurn",
+                                         _("biblioteka LightBurna %s") % (name or "?"))
+    return profs, skipped, name
+
+
+class _LbEvents(object):
+    """Strumien zdarzen (SSE) czekajacy na file_imported. Otwierany przed wyslaniem pliku."""
+
+    def __init__(self, cfg, secret, timeout):
+        import urllib.request
+        self.result = None
+        self.done = threading.Event()
+        self.ready = threading.Event()
+        self.resp = None
+        req = urllib.request.Request(lb_url(cfg) + "/api/events", method="GET", headers={
+            "Authorization": "Bearer " + lb_token(secret), "Accept": "text/event-stream"})
+        self.thread = threading.Thread(target=self._run, args=(req, timeout), daemon=True)
+        self.thread.start()
+
+    def _run(self, req, timeout):
+        try:
+            self.resp = _lb_open(req, timeout)
+            event, data = "", []
+            while not self.done.is_set():
+                raw = self.resp.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line.startswith(":"):
+                    self.ready.set()
+                    continue
+                if not line:
+                    if event == "file_imported":
+                        try:
+                            self.result = json.loads("\n".join(data) or "{}")
+                        except ValueError:
+                            self.result = {}
+                        break
+                    event, data = "", []
+                    continue
+                self.ready.set()
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:"):
+                    data.append(line[5:].strip())
+        except Exception:
+            pass
+        finally:
+            self.ready.set()
+            self.done.set()
+
+    def close(self):
+        """Konczy nasluch bez czekania (zamkniecie w tle: readline moze jeszcze blokowac)."""
+        self.done.set()
+        resp = self.resp
+
+        def _close():
+            try:
+                if resp is not None:
+                    resp.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=_close, daemon=True).start()
+
+
+def lb_send(cfg, log, name, data, mode="open", wait=None):
+    """Wysyla projekt .lbrn2 do LightBurna. mode: 'open' (zastepuje projekt) albo 'import'
+    (wstawia do biezacego). Zwraca True (potwierdzone), False (blad) albo None (brak potwierdzenia)."""
+    path = "/api/file/open" if mode == "open" else "/api/file/upload"
+    if wait is None:
+        # przy otwieraniu LightBurn moze najpierw zapytac o zapis biezacego projektu
+        wait = 120 if mode == "open" else 30
+    import unicodedata
+    # naglowek HTTP: tylko ASCII (polskie litery bez ogonkow, reszta jako _)
+    safe = "".join(c if 32 <= ord(c) < 127 else "_"
+                   for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c))
+
+    def send(secret):
+        ev = _LbEvents(cfg, secret, wait + 5)
+        ev.ready.wait(3)
+        try:
+            st, resp = lb_request(cfg, "POST", path, secret, body=data, timeout=60, headers={
+                "Content-Type": "application/octet-stream", "X-Filename": safe})
+            if st != 202:
+                try:
+                    ok = json.loads(resp.decode("utf-8")).get("status") == "accepted"
+                except Exception:
+                    ok = False
+                if not ok:
+                    raise LightBurnError(_("LightBurn nie przyjął pliku (odpowiedź %d). Czy pod tym "
+                                         "adresem działa LightBurn 2.2 lub nowszy?") % st)
+            ev.done.wait(wait)
+            return ev.result
+        finally:
+            ev.close()
+
+    res = lb_call(cfg, log, send)
+    if res is None:
+        return None
+    if not isinstance(res, dict):
+        res = {}
+    if res.get("success"):
+        return True
+    log(_("LightBurn: import nieudany: %s") % (res.get("error") or "?"))
+    return False
+
+
+def output_name(path, index, count, cv):
+    """Nazwa pliku .lbrn2 dla planszy (tak samo jak przy zapisie na dysk)."""
+    suffix = "" if count == 1 else "_%d_%s" % (index + 1, safe_stem(cv.file_name))
+    return Path(path).stem + suffix + ".lbrn2"
+
 
 
 # ----------------------------------------------------------------------------
@@ -2008,8 +2572,37 @@ def _mix_white(color, k=0.65):
 # Interfejs
 # ----------------------------------------------------------------------------
 
-def open_material_editor(root, db, on_saved, readonly=False):
+def run_background(widget, fn, done):
+    """fn() w osobnym watku; done(wynik, wyjatek) w watku okna (gdy okno jeszcze istnieje)."""
+    res = {}
+
+    def runner():
+        try:
+            res["ok"] = fn()
+        except Exception as e:  # przekazywany do done()
+            res["err"] = e
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+
+    def poll():
+        try:
+            if not widget.winfo_exists():
+                return
+        except Exception:
+            return
+        if t.is_alive():
+            widget.after(150, poll)
+        else:
+            done(res.get("ok"), res.get("err"))
+
+    widget.after(150, poll)
+    return t
+
+
+def open_material_editor(root, db, on_saved, readonly=False, cfg=None):
     """Okno edycji bazy materialow. on_saved(db) wywolywane po zapisie.
+    cfg: wspolna konfiguracja okna glownego (polaczenie z LightBurnem).
     Zwraca okno (atrybut _close: zamkniecie z pytaniem o zapis)."""
     import copy
     import tkinter as tk
@@ -2250,31 +2843,21 @@ def open_material_editor(root, db, on_saved, readonly=False):
         refresh()
         messagebox.showinfo(_("Przykłady"), _("Dopisano %d materiałów.") % n, parent=win)
 
-    def import_db():
-        from tkinter import filedialog
-        fn = filedialog.askopenfilename(parent=win, title=_("Importuj materiały"),
-                                        filetypes=[("JSON", "*.json"), (_("Wszystkie pliki"), "*.*")])
-        if not fn:
-            return
-        sk = []
-        try:
-            other = load_materials(path=fn, skipped=sk, create=False)
-        except Exception as e:
-            messagebox.showerror(_("Import"), friendly_error(e), parent=win)
-            return
+    def merge(other, sk, title):
+        """Dodaje profile z importu; pyta o dublety nazw."""
         have = {p["name"]: p for p in work["profiles"]}
-        dup = [p for p in other["profiles"] if p["name"] in have]
+        dup = [p for p in other if p["name"] in have]
         overwrite = False
         if dup:
             ans = messagebox.askyesnocancel(
-                _("Import"), _("%d materiałów o tych samych nazwach już jest w bazie.\n\n"
-                               "Tak: zastąp je importowanymi.\nNie: dodaj importowane z "
-                               "dopiskiem (import).") % len(dup), parent=win)
+                title, _("%d materiałów o tych samych nazwach już jest w bazie.\n\n"
+                         "Tak: zastąp je importowanymi.\nNie: dodaj importowane z "
+                         "dopiskiem (import).") % len(dup), parent=win)
             if ans is None:
                 return
             overwrite = ans
         n = 0
-        for p in other["profiles"]:
+        for p in other:
             if p["name"] in have:
                 if overwrite:
                     have[p["name"]].clear()
@@ -2291,9 +2874,59 @@ def open_material_editor(root, db, on_saved, readonly=False):
         state["dirty"] = state["dirty"] or n > 0
         refresh()
         msg = _("Zaimportowano %d materiałów.") % n
+        if n and not readonly:
+            msg += "\n" + _("Sprawdź wartości i kliknij Zapisz.")
         if sk:
             msg += "\n\n" + _("Pominięto błędne wpisy:") + "\n" + "\n".join(sk[:15])
-        messagebox.showinfo(_("Import"), msg, parent=win)
+            if len(sk) > 15:
+                msg += "\n" + _("... i %d innych") % (len(sk) - 15)
+        messagebox.showinfo(title, msg, parent=win)
+
+    def import_db():
+        from tkinter import filedialog
+        fn = filedialog.askopenfilename(
+            parent=win, title=_("Importuj materiały"),
+            filetypes=[(_("Baza konwertera lub biblioteka LightBurna"), "*.json *.clb"),
+                       (_("Baza konwertera"), "*.json"), (_("Biblioteka LightBurna"), "*.clb"),
+                       (_("Wszystkie pliki"), "*.*")])
+        if not fn:
+            return
+        sk = []
+        try:
+            if fn.lower().endswith(".clb"):
+                other, sk = clb_to_profiles(fn)
+            else:
+                other = load_materials(path=fn, skipped=sk, create=False)["profiles"]
+        except Exception as e:
+            messagebox.showerror(_("Import"), friendly_error(e), parent=win)
+            return
+        if not other:
+            messagebox.showinfo(_("Import"), _("W pliku nie ma materiałów do zaimportowania.") +
+                                ("\n\n" + "\n".join(sk[:15]) if sk else ""), parent=win)
+            return
+        merge(other, sk, _("Import"))
+
+    def import_lb():
+        conf = cfg if cfg is not None else load_config()
+        lb_btn.state(["disabled"])
+        status.configure(text=_("Łączenie z LightBurnem... Przy pierwszym połączeniu zatwierdź je "
+                                "w oknie LightBurna (masz 30 s)."))
+
+        def done(res, err):
+            lb_btn.state(["!disabled"])
+            status.configure(text="")
+            if err is not None:
+                messagebox.showerror(_("Import z LightBurna"), friendly_error(err), parent=win)
+                return
+            profs, sk, name = res
+            if not profs:
+                messagebox.showinfo(_("Import z LightBurna"),
+                                    _("W bibliotece nie ma materiałów do zaimportowania.") +
+                                    ("\n\n" + "\n".join(sk[:15]) if sk else ""), parent=win)
+                return
+            merge(profs, sk, _("Import z LightBurna"))
+
+        run_background(win, lambda: lb_material_profiles(conf, lambda m: None), done)
 
     def export_db():
         from tkinter import filedialog
@@ -2344,11 +2977,16 @@ def open_material_editor(root, db, on_saved, readonly=False):
     bar = ttk.Frame(win, padding=8)
     bar.pack(fill="x")
     for txt, cmd in ((_("Dodaj..."), add), (_("Edytuj..."), edit), (_("Duplikuj"), dup),
-                     (_("Usuń"), delete), (_("Importuj..."), import_db),
-                     (_("Eksportuj..."), export_db), (_("Dopisz przykłady"), restore)):
+                     (_("Usuń"), delete), (_("Importuj..."), import_db)):
+        ttk.Button(bar, text=txt, command=cmd).pack(side="left", padx=(0, 6))
+    lb_btn = ttk.Button(bar, text=_("Z LightBurna..."), command=import_lb)
+    lb_btn.pack(side="left", padx=(0, 6))
+    for txt, cmd in ((_("Eksportuj..."), export_db), (_("Dopisz przykłady"), restore)):
         ttk.Button(bar, text=txt, command=cmd).pack(side="left", padx=(0, 6))
     ttk.Button(bar, text=_("Zamknij"), command=close).pack(side="right")
     ttk.Button(bar, text=_("Zapisz"), command=save).pack(side="right", padx=6)
+    status = ttk.Label(win, padding=(8, 0, 8, 0), foreground="#0a5", text="")
+    status.pack(anchor="w", fill="x")
     info = ttk.Label(win, padding=(8, 0, 8, 8), foreground="#555", wraplength=1100,
                      justify="left", text="")
     info.pack(anchor="w", fill="x")
@@ -2361,6 +2999,8 @@ def open_material_editor(root, db, on_saved, readonly=False):
     tree.bind("<Double-Button-1>", edit)
     win.protocol("WM_DELETE_WINDOW", close)
     win._close = close
+    win._import_lb = import_lb
+    win._work = work
     refresh()
     if readonly:
         win.title(_("Baza materiałów (TYLKO PODGLĄD, plik uszkodzony): %s") % MATERIALS_PATH)
@@ -2578,9 +3218,10 @@ def build_gui(root, on_lang=None, keep=None):
         code = {n: c for c, n in langs}[langvar.get()]
         if code == LANG:
             return
-        if "disabled" in btn.state():
+        if app.get("ops"):
             langvar.set(dict(langs)[LANG])
-            messagebox.showinfo(_("Język"), _("Poczekaj na koniec konwersji."))
+            messagebox.showinfo(_("Język"), _("Poczekaj na koniec konwersji albo wysyłki do "
+                                             "LightBurna."))
             return
         edw = mstate.get("editor")
         if edw is not None and edw.winfo_exists():
@@ -2727,7 +3368,8 @@ def build_gui(root, on_lang=None, keep=None):
             ed.lift()
             ed.focus_force()
             return
-        mstate["editor"] = open_material_editor(root, mstate["db"], saved_db, readonly=broken)
+        mstate["editor"] = open_material_editor(root, mstate["db"], saved_db, readonly=broken,
+                                                cfg=cfg)
 
     mcb.bind("<<ComboboxSelected>>", on_mat)
     ttk.Button(mrow, text=_("Edytuj bazę..."), command=open_editor).pack(side="left", padx=6)
@@ -2761,6 +3403,12 @@ def build_gui(root, on_lang=None, keep=None):
 
     btn = ttk.Button(frm, text=_("Konwertuj wszystkie pliki z listy"))
     btn.pack(side="bottom", fill="x", pady=(6, 0))
+    lbrow = ttk.Frame(frm)
+    lbrow.pack(side="bottom", fill="x", pady=(6, 0))
+    lb_open_btn = ttk.Button(lbrow, text=_("Otwórz w LightBurnie"))
+    lb_open_btn.pack(side="left", fill="x", expand=True)
+    lb_imp_btn = ttk.Button(lbrow, text=_("Wstaw do projektu w LightBurnie"))
+    lb_imp_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
     lf = ttk.Frame(frm)
     lf.pack(fill="both", expand=True, pady=(8, 0))
     log_box = tk.Text(lf, height=10, width=48, wrap="word", state="disabled")
@@ -3049,6 +3697,8 @@ def build_gui(root, on_lang=None, keep=None):
             q.put(("done", (gen_, errors)))
 
     def start():
+        if app.get("ops"):
+            return
         if not files:
             messagebox.showinfo("xs2lightburn", _("Najpierw dodaj pliki."))
             return
@@ -3068,13 +3718,82 @@ def build_gui(root, on_lang=None, keep=None):
                 log(_("UWAGA: %s zmienił się na dysku po ręcznej edycji warstw; te zmiany "
                     "pominięto") % Path(f).name)
             jobs.append((f, copy.deepcopy(ov) if ov and any(ov.values()) else None))
-        btn.state(["disabled"])
+        busy(1)
         app["edit_gen"] = app.get("edit_gen", 0)
-        threading.Thread(target=work, daemon=True,
-                         args=(jobs, cfg["out_dir"], fx, fy, cfg["overwrite"], mat,
-                               app["edit_gen"])).start()
+        try:
+            threading.Thread(target=work, daemon=True,
+                             args=(jobs, cfg["out_dir"], fx, fy, cfg["overwrite"], mat,
+                                   app["edit_gen"])).start()
+        except Exception:
+            busy(-1)
+            raise
 
     btn.configure(command=start)
+
+    def busy(delta):
+        """Jeden licznik zajetosci: konwersja i wysylka do LightBurna blokuja te same przyciski
+        oraz zmiane jezyka."""
+        app["ops"] = max(0, app.get("ops", 0) + delta)
+        if not app["alive"]:
+            return
+        for b in (btn, lb_open_btn, lb_imp_btn):
+            b.state(["disabled"] if app["ops"] else ["!disabled"])
+
+    def lb_action(mode):
+        """Wysyla pokazana plansze (z biezacym materialem, odbiciami i zmianami warstw)."""
+        import copy
+        if app.get("ops"):
+            return
+        shown = app.get("shown")
+        if not shown or shown[0] != context():
+            messagebox.showinfo("xs2lightburn", _("Kliknij plik na liście i poczekaj na podgląd."))
+            return
+        ctx, real_i = shown
+        f = ctx[0]
+        mat = current_material()
+        fx, fy = flips()
+        ov = ov_for(ctx, real_i)
+        ov = copy.deepcopy(ov) if ov else None
+        busy(1)
+
+        def job():
+            canvases = read_project(Path(f), log)
+            cv = canvases[real_i]
+            xml, nshapes, _plan = convert_canvas(cv, log, fx, fy, mat, ov)
+            if not nshapes:
+                raise ValueError(_("plansza nie ma elementów do wysłania"))
+            name = output_name(f, real_i, len(canvases), cv)
+            log(_("LightBurn: wysyłam %s ...") % name)
+            if mode == "open":
+                log(_("  Jeśli bieżący projekt w LightBurnie ma niezapisane zmiany, LightBurn "
+                      "zapyta o zapis."))
+            return name, lb_send(cfg, log, name, xml.encode("utf-8"), mode)
+
+        def done(res, err):
+            busy(-1)
+            if err is not None:
+                log(_("LightBurn: %s") % friendly_error(err))
+                return
+            name, r = res
+            if r is True:
+                log(_("LightBurn: otwarto %s") % name if mode == "open" else
+                    _("LightBurn: wstawiono %s do bieżącego projektu") % name)
+            elif r is None:
+                log(_("LightBurn: wysłano %s (LightBurn nie potwierdził importu; sprawdź okno "
+                      "LightBurna)") % name)
+            if r is not False:
+                log(_("  Plik nie jest zapisany na dysku: zapisz projekt w LightBurnie "
+                      "(File > Save) albo użyj przycisku konwersji."))
+
+        log(_("LightBurn: przygotowuję %s ...") % Path(f).name)
+        try:
+            run_background(root, job, done)
+        except Exception:
+            busy(-1)
+            raise
+
+    lb_open_btn.configure(command=lambda: lb_action("open"))
+    lb_imp_btn.configure(command=lambda: lb_action("import"))
 
     def pump():
         if not app["alive"]:
@@ -3083,7 +3802,7 @@ def build_gui(root, on_lang=None, keep=None):
             while True:
                 kind, m = q.get_nowait()
                 if kind == "done":
-                    btn.state(["!disabled"])
+                    busy(-1)
                     gen_, errors = m
                     # zmiany zapisane tylko, gdy nie edytowano w trakcie i nie bylo bledow
                     if gen_ == app.get("edit_gen", 0) and not errors:
@@ -3144,6 +3863,7 @@ def build_gui(root, on_lang=None, keep=None):
                 "mstate": mstate, "context": context, "log_box": log_box, "on_mat": on_mat,
                 "fill_materials": fill_materials, "langvar": langvar,
                 "on_lang_change": on_lang_change, "outvar": outvar, "owv": owv,
+                "lb_action": lb_action, "cfg": cfg,
                 "broken": broken})
     if keep:
         app["overrides"].update(keep.get("overrides", {}))
@@ -3189,6 +3909,9 @@ def run_gui(root=None, holder=None, mainloop=True):
         for w in root.winfo_children():
             w.destroy()
         holder.append(build_gui(root, on_lang=rebuild, keep=keep))
+        # stare zmienne Tk sprzatamy w watku okna; sprzatanie w watku roboczym moze zablokowac Tk
+        import gc
+        gc.collect()
 
     holder.append(build_gui(root, on_lang=rebuild))
     if mainloop:
@@ -3226,11 +3949,38 @@ def run_console(args):
         if mat is None:
             print(_("BŁĄD: nie ma w bazie materiału '%s' (lista: --list-materials)") % args.material)
             sys.exit(1)
+    written = []
+    failed = 0
     for f in files:
         try:
-            convert_file(f, out, print, fx, fy, args.overwrite, mat)
+            written += convert_file(f, out, print, fx, fy, args.overwrite, mat)
         except Exception as e:
+            failed += 1
             print(_("BŁĄD (%s): %s") % (f, friendly_error(e)))
+    mode = getattr(args, "lightburn", None)
+    if not mode:
+        return
+    if failed or not written:
+        print(_("LightBurn: nic nie wysłano (błędy konwersji albo brak zapisanych plików)."))
+        sys.exit(1)
+    if mode == "open" and len(written) > 1:
+        print(_("LightBurn: --lightburn open otwiera jeden plik, a zapisano %d; użyj "
+                "--lightburn import, żeby wstawić wszystkie do bieżącego projektu.") % len(written))
+        sys.exit(1)
+    for w in written:
+        try:
+            r = lb_send(cfg, print, w.name, w.read_bytes(), mode)
+        except Exception as e:
+            print(_("LightBurn: %s") % friendly_error(e))
+            sys.exit(1)
+        if r is True:
+            print(_("LightBurn: otwarto %s") % w.name if mode == "open" else
+                  _("LightBurn: wstawiono %s do bieżącego projektu") % w.name)
+        elif r is None:
+            print(_("LightBurn: wysłano %s (LightBurn nie potwierdził importu; sprawdź okno "
+                    "LightBurna)") % w.name)
+        else:
+            sys.exit(1)
 
 
 def main(argv=None):
@@ -3267,6 +4017,9 @@ def main(argv=None):
     ap.add_argument("--overwrite", action="store_true", help=_("nadpisuj istniejące .lbrn2"))
     ap.add_argument("--material", default=None, help=_("nazwa materiału z bazy"))
     ap.add_argument("--list-materials", action="store_true", help=_("pokaż materiały z bazy"))
+    ap.add_argument("--lightburn", choices=("open", "import"), default=None,
+                    help=_("po konwersji wyślij do działającego LightBurna 2.2+: open = otwórz "
+                           "(jeden plik), import = wstaw do bieżącego projektu"))
     codes = [c for c, _n in available_languages()]
     ap.add_argument("--lang", default=None, help=" / ".join(codes))
     args = ap.parse_args(argv)
@@ -3280,7 +4033,7 @@ def main(argv=None):
         for p in sorted(db["profiles"], key=profile_sort_key):
             print("  %-20s %s" % (p["group"], p["name"]))
         return
-    if args.files or args.nogui or args.material:
+    if args.files or args.nogui or args.material or args.lightburn:
         run_console(args)
         return
     try:

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -479,6 +480,8 @@ def test_gui_language_switch():
         assert len(new["log_box"].get("1.0", "end-1c")) >= log_len
     finally:
         root.destroy()
+        import gc
+        gc.collect()   # free Tk objects in the main thread, not in a later worker thread
         X.set_lang("en")
 
 
@@ -576,6 +579,342 @@ def test_cli():
     r = subprocess.run([sys.executable, script, "--list-materials", "--lang=en"],
                        capture_output=True, text=True, encoding="utf-8", env=env)
     assert "Example: birch plywood 3 mm" in r.stdout
+
+
+CLB = b"""<?xml version="1.0" encoding="UTF-8"?>
+<LightBurnLibrary DisplayName="Test lib">
+  <Material name="Plywood">
+    <Entry Thickness="3.0000" Desc="Cut">
+      <CutSetting type="Cut"><index Value="0"/><minPower Value="15"/><maxPower Value="60"/>
+        <speed Value="25"/><numPasses Value="2"/></CutSetting>
+    </Entry>
+    <Entry Thickness="3.0000" Desc="Cut slow">
+      <CutSetting type="Cut"><minPower Value="15"/><maxPower Value="70"/><speed Value="15"/></CutSetting>
+    </Entry>
+    <Entry Thickness="6.0000" Desc="Cut">
+      <CutSetting type="Cut"><maxPower Value="70"/><speed Value="10"/><kerf Value="0.1"/></CutSetting>
+    </Entry>
+    <Entry Thickness="-1.0000" NoThickTitle="Engrave" Desc="Fill">
+      <CutSetting type="Scan"><minPower Value="10"/><maxPower Value="20"/><speed Value="400"/>
+        <interval Value="0.08"/><runBlower Value="0"/></CutSetting>
+    </Entry>
+    <Entry Thickness="-1.0000" NoThickTitle="Photo" Desc="Image">
+      <CutSetting_Img type="Image"><maxPower Value="30"/><speed Value="300"/><dpi Value="254"/>
+        <ditherMode Value="stucki"/></CutSetting_Img>
+    </Entry>
+  </Material>
+  <Material name="Anodized Al">
+    <Entry Thickness="-1.0000" NoThickTitle="Mark" Desc="Score">
+      <CutSetting type="Cut"><maxPower Value="25"/><speed Value="200"/></CutSetting>
+    </Entry>
+    <Entry Thickness="-1.0000" NoThickTitle="Odd" Desc="Tool">
+      <CutSetting type="Tool"><maxPower Value="25"/><speed Value="200"/></CutSetting>
+    </Entry>
+    <Entry Thickness="-1.0000" NoThickTitle="Bad" Desc="Too fast">
+      <CutSetting type="Scan"><maxPower Value="25"/><speed Value="99999"/></CutSetting>
+    </Entry>
+  </Material>
+</LightBurnLibrary>
+"""
+
+
+def _by_name(profiles):
+    return {p["name"]: p for p in profiles}
+
+
+def test_clb_import():
+    X.set_lang("en")
+    t = tmpdir()
+    (t / "lib.clb").write_bytes(CLB)
+    profs, skipped = X.clb_to_profiles(t / "lib.clb")
+    p = _by_name(profs)
+    assert sorted(p) == ["Anodized Al", "Plywood 3 mm", "Plywood 3 mm (Cut slow)", "Plywood 6 mm"]
+    ply3 = p["Plywood 3 mm"]
+    assert ply3["group"] == "LightBurn: Test lib" and ply3["thickness"] == 3
+    assert ply3["ops"]["cut"] == {"speed": 25.0, "min": 15.0, "max": 60.0, "passes": 2, "air": True}
+    # entries without thickness (engrave, image) are shared by every thickness
+    assert ply3["ops"]["fill"]["interval"] == 0.08 and ply3["ops"]["fill"]["air"] is False
+    assert ply3["ops"]["image"]["dither"] == "stucki" and ply3["ops"]["image"]["interval"] == 0.1
+    assert p["Plywood 6 mm"]["ops"]["cut"]["kerf"] == 0.1
+    assert p["Plywood 6 mm"]["ops"]["cut"]["min"] == 70.0      # no minPower -> max
+    assert p["Plywood 3 mm (Cut slow)"]["ops"]["cut"]["speed"] == 15.0
+    assert list(p["Anodized Al"]["ops"]) == ["line"]           # no thickness + "Score" -> line
+    assert len(skipped) == 2 and any("Tool" in x for x in skipped)
+    # every imported profile is valid for the converter
+    assert all(X.clean_profile(x) == x for x in profs)
+    root = ET.parse(convert(write_xcs(t / "s.xcs"), t, material=ply3)).getroot()
+    cut = [c for c in layers(root) if " Cut " in val(c, "name")][0]
+    assert (val(cut, "maxPower"), val(cut, "speed"), val(cut, "numPasses")) == ("60", "25", "2")
+
+
+def test_clb_rejects_bad_files():
+    t = tmpdir()
+    for name, data in (("a.clb", b"<notalibrary/>"), ("b.clb", b"garbage<<"),
+                       ("c.clb", b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaa">]>'
+                                 b'<LightBurnLibrary/>')):
+        (t / name).write_bytes(data)
+        try:
+            X.clb_to_profiles(t / name)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(name)
+
+
+API_LIB = {"product": "lightburn", "name": "Shop", "entries": [
+    {"guid": 1, "material": "Birch", "description": "Cut", "thickness": 3, "no_thick_title": "",
+     "cut": {"kind": "normal", "mode": "cut", "index": -1, "params": {
+         "speed": 1200, "min_power": 20, "max_power": 60, "num_passes": 2, "kerf": 0.004,
+         "gantry": {"run_blower": False}}}},
+    {"guid": 2, "material": "Birch", "description": "Fill", "thickness": -1,
+     "no_thick_title": "Engrave", "cut": {"kind": "normal", "mode": "scan", "params": {
+         "speed": 24000, "min_power": 10, "max_power": 20, "num_passes": 1, "interval": 0.004}}},
+    {"guid": 3, "material": "Birch", "description": "Photo", "thickness": -1,
+     "no_thick_title": "Image", "cut": {"kind": "image", "params": {
+         "speed": 18000, "max_power": 30, "dpi": 254, "dither_mode": "Stucki"}}},
+]}
+
+
+def test_api_library_units():
+    # LightBurn reports values in its display units: here mm/min and inches
+    entries = X.api_library_entries(API_LIB, {"units": "mm/min", "distance_units": "in"})
+    profs, skipped = X.library_to_profiles(entries, "Shop", "test")
+    assert not skipped and len(profs) == 1
+    ops = profs[0]["ops"]
+    assert profs[0]["name"] == "Birch 3 mm"
+    assert ops["cut"]["speed"] == 20.0 and ops["cut"]["air"] is False
+    assert abs(ops["cut"]["kerf"] - 0.1016) < 1e-9
+    assert ops["fill"]["speed"] == 400.0 and abs(ops["fill"]["interval"] - 0.1016) < 1e-9
+    assert ops["image"]["dither"] == "stucki" and ops["image"]["interval"] == 0.1
+    try:
+        X.api_library_entries(API_LIB, {"units": "furlong/fortnight"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown units accepted")
+
+
+def _fake(**kw):
+    sys.path.insert(0, str(ROOT / "tests"))
+    from mock_lightburn import FakeLightBurn
+    return FakeLightBurn(**kw)
+
+
+class _TempPaths:
+    """Config and LightBurn secret files in a temporary folder."""
+
+    def __enter__(self):
+        t = tmpdir()
+        self.old = (X.CONFIG_PATH, X.LB_SECRET_PATH)
+        X.CONFIG_PATH, X.LB_SECRET_PATH = t / "cfg.json", t / "secret.json"
+        return t
+
+    def __exit__(self, *a):
+        X.CONFIG_PATH, X.LB_SECRET_PATH = self.old
+        return False
+
+
+def test_lightburn_api_client():
+    X.set_lang("en")
+    with _TempPaths():
+        fake = _fake(library=API_LIB, units={"units": "mm/s", "distance_units": "mm"})
+        try:
+            cfg = {"lightburn_url": fake.url}
+            logs = []
+            profs, skipped, name = X.lb_material_profiles(cfg, logs.append)
+            assert name == "Shop" and profs and fake.pairings == 1
+            assert X.lb_secret(cfg) == "secret1" and "lightburn_secret" not in cfg
+            stored = json.loads(X.LB_SECRET_PATH.read_text())["secrets"]
+            assert stored == {fake.url: "secret1"}
+            if os.name == "posix":
+                assert X.LB_SECRET_PATH.stat().st_mode & 0o077 == 0
+            r = X.lb_send(cfg, logs.append, "Próba ł.lbrn2", b"<LightBurnProject/>", "open")
+            path, headers, body = fake.received[-1]
+            assert r is True and path == "/api/file/open" and body == b"<LightBurnProject/>"
+            assert headers["X-Filename"] == "Proba _.lbrn2" and fake.pairings == 1
+            fake.revoke_all()                            # revoked in LightBurn -> pair again
+            assert X.lb_send(cfg, logs.append, "b.lbrn2", b"x", "import") is True
+            assert fake.pairings == 2 and fake.received[-1][0] == "/api/file/upload"
+            assert X.lb_secret(cfg) == "secret2"
+            fake.import_result = {"success": False, "error": "bad file"}
+            assert X.lb_send(cfg, logs.append, "c.lbrn2", b"x", "import") is False
+            fake.import_result = True                    # not an object: no crash
+            assert X.lb_send(cfg, logs.append, "c.lbrn2", b"x", "import") is False
+            fake.send_events = False
+            assert X.lb_send(cfg, logs.append, "d.lbrn2", b"x", "import", wait=1) is None
+            fake.html_on_upload = True                   # some other web server on the port
+            try:
+                X.lb_send(cfg, logs.append, "h.lbrn2", b"x", "import", wait=1)
+            except X.LightBurnError:
+                pass
+            else:
+                raise AssertionError("HTML answer accepted")
+            fake.html_on_upload = False
+            fake.approve = False
+            fake.revoke_all()
+            try:
+                X.lb_send(cfg, logs.append, "e.lbrn2", b"x", "import")
+            except X.LightBurnError as e:
+                assert e.code == 403
+            else:
+                raise AssertionError("declined pairing accepted")
+        finally:
+            fake.close()
+        try:
+            X.lb_material_profiles({"lightburn_url": fake.url}, quiet)
+        except X.LightBurnError as e:
+            assert "LightBurn 2.2" in str(e)
+        else:
+            raise AssertionError("no error without LightBurn")
+
+
+def test_settings_and_secret_files():
+    with _TempPaths() as t:
+        # settings: atomic, no temp files left, symlink kept, old dev-build secret dropped
+        X.save_config({"lang": "en", "lightburn_secret": "OLD"})
+        assert X.load_config() == {"lang": "en"}
+        assert "OLD" not in X.CONFIG_PATH.read_text()      # removed from disk right away
+        if os.name == "posix":
+            X.CONFIG_PATH.chmod(0o600)
+            X.save_config({"lang": "en"})
+            assert X.CONFIG_PATH.stat().st_mode & 0o777 == 0o600   # existing mode kept
+        assert not list(t.glob("*.tmp"))
+        if os.name == "posix":
+            real = t / "real.json"
+            real.write_text("{}")
+            X.CONFIG_PATH.unlink()
+            X.CONFIG_PATH.symlink_to(real)
+            X.save_config({"lang": "pl"})
+            assert X.CONFIG_PATH.is_symlink() and json.loads(real.read_text()) == {"lang": "pl"}
+        # damaged secret file: treated as empty, then overwritten
+        cfg = {"lightburn_url": "http://127.0.0.1:1"}
+        X.LB_SECRET_PATH.write_text("{garbage")
+        assert X.lb_secret(cfg) is None
+        X.lb_set_secret(cfg, "abc")
+        assert X.lb_secret(cfg) == "abc"
+        if os.name == "posix":
+            assert X.LB_SECRET_PATH.stat().st_mode & 0o077 == 0
+        X.lb_set_secret(cfg, None)
+        assert X.lb_secret(cfg) is None and not list(t.glob("*.tmp"))
+
+
+def test_api_library_requires_units():
+    for units in ({}, {"units": "mm/s"}, {"distance_units": "mm"}, None):
+        try:
+            X.api_library_entries(API_LIB, units)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(units)
+
+
+def test_line_heuristic_whole_words():
+    for label in ("Cut outline", "Remark cut", "Cut - Spline", "linia cięcia", "Through cut"):
+        assert X._lib_kind("Cut", 3.0, label) == "cut", label
+    for label in ("Score", "Engrave lines", "Mark", "Grawer", "etching"):
+        assert X._lib_kind("Cut", 3.0, label) == "line", label
+    assert X._lib_kind("Cut", None, "Cut") == "line"
+
+
+def test_clb_rejects_hidden_entities():
+    t = tmpdir()
+    pad = b"<!--" + b"x" * 5000 + b"-->"
+    bomb = (b'<?xml version="1.0"?>' + pad + b'<!DOCTYPE l [<!ENTITY a "aaaa">]>'
+            b'<LightBurnLibrary><Material name="&a;"/></LightBurnLibrary>')
+    (t / "pad.clb").write_bytes(bomb)
+    (t / "u16.clb").write_bytes(bomb.decode("ascii").encode("utf-16"))
+    for name in ("pad.clb", "u16.clb"):
+        try:
+            X.clb_to_profiles(t / name)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(name)
+    # BOM + XML declaration with encoding is fine
+    (t / "bom.clb").write_bytes(b"\xef\xbb\xbf" + CLB)
+    assert X.clb_to_profiles(t / "bom.clb")[0]
+
+
+def test_cli_send_to_lightburn():
+    t = tmpdir()
+    fake = _fake()
+    try:
+        (t / ".xs2lightburn.json").write_text(json.dumps({"lightburn_url": fake.url}),
+                                              encoding="utf-8")
+        src = write_xcs(t / "s.xcs")
+        env = dict(os.environ, HOME=str(t), USERPROFILE=str(t), PYTHONIOENCODING="utf-8")
+        cmd = [sys.executable, "-B", str(ROOT / "xs2lightburn.py"), "-o", str(t), "--lang", "en",
+               "--overwrite"]
+        r = subprocess.run(cmd + [str(src), "--lightburn", "open"], capture_output=True,
+                           text=True, encoding="utf-8", env=env, timeout=60)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "LightBurn: opened s.lbrn2" in r.stdout, r.stdout
+        path, headers, body = fake.received[-1]
+        assert path == "/api/file/open" and body == (t / "s.lbrn2").read_bytes()
+        assert json.loads((t / ".xs2lightburn_lightburn.json").read_text())["secrets"][fake.url]
+        assert "secret" not in (t / ".xs2lightburn.json").read_text()
+        # a failed conversion must give a non-zero exit code
+        r = subprocess.run(cmd + [str(t / "missing.xcs"), "--lightburn", "import"],
+                           capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+        assert r.returncode == 1 and "nothing sent" in r.stdout, r.stdout
+    finally:
+        fake.close()
+
+
+def test_gui_lightburn_buttons():
+    if sys.platform != "win32" and not os.environ.get("DISPLAY"):
+        return _skip("no display")
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+    except Exception:
+        return _skip("no tkinter")
+    fake = _fake(library=API_LIB)
+    paths = _TempPaths()
+    t = paths.__enter__()
+    X.CONFIG_PATH.write_text(json.dumps({"lightburn_url": fake.url}), encoding="utf-8")
+    shown = []
+    saved = (messagebox.showinfo, messagebox.showerror, messagebox.askyesnocancel)
+    messagebox.showinfo = lambda *a, **k: shown.append(("info",) + a)
+    messagebox.showerror = lambda *a, **k: shown.append(("error",) + a)
+    messagebox.askyesnocancel = lambda *a, **k: False     # duplicates: add with "(import)"
+    try:
+        X.set_lang("en")
+        app = X.run_gui(root, mainloop=False)[-1]
+        src = write_xcs(t / "s.xcs")
+        app["add_paths"]([str(src)])
+
+        def wait(cond, secs=15):
+            end = time.time() + secs
+            while time.time() < end and not cond():
+                root.update()
+                time.sleep(0.05)
+            return cond()
+
+        assert wait(lambda: app.get("shown") is not None), "preview not ready"
+        app["lb_action"]("open")
+        assert wait(lambda: fake.received), app["log_box"].get("1.0", "end")
+        path, headers, body = fake.received[-1]
+        assert path == "/api/file/open" and headers["X-Filename"] == "s.lbrn2"
+        assert b"<LightBurnProject" in body
+        assert wait(lambda: "LightBurn: opened s.lbrn2" in app["log_box"].get("1.0", "end"))
+        assert not list(t.glob("*.lbrn2"))                 # nothing written to disk
+        # material editor: import from the library selected in LightBurn
+        ed = X.open_material_editor(root, app["mstate"]["db"], lambda d: None, cfg=app["cfg"])
+        ed._import_lb()
+        assert wait(lambda: any(x[0] == "info" for x in shown)), shown
+        names = [p["name"] for p in ed._work["profiles"]]
+        assert "Birch 3 mm" in names, names
+        ed.destroy()
+    finally:
+        messagebox.showinfo, messagebox.showerror, messagebox.askyesnocancel = saved
+        root.destroy()
+        import gc
+        gc.collect()   # free Tk objects in the main thread, not in a later worker thread
+        fake.close()
+        paths.__exit__()
+        X.set_lang("en")
 
 
 def main():
